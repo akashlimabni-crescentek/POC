@@ -19,6 +19,7 @@ const {
   maxCandleTs,
   mergeLastCandleTs,
   chunkArray,
+  splitTimeWindowsForCandles,
 } = require('../../lib/history-common');
 const { aggregateToInterval } = require('../../lib/ohlc');
 
@@ -45,27 +46,66 @@ function probFromDollars(value) {
   return normalizePrice('kalshi', value, { unit: 'dollars' });
 }
 
+function probFromSide(side, field) {
+  if (!side) return null;
+  return probFromDollars(side[field]);
+}
+
+function midOr(left, right) {
+  if (left != null && right != null) return (left + right) / 2;
+  return left ?? right ?? null;
+}
+
 /** Map Kalshi candlestick — normalize all prices to 0–1 on write */
 function mapKalshiCandlestick(candle) {
   const price = candle.price ?? {};
-  const open = probFromDollars(price.open_dollars ?? price.previous_dollars);
-  const high = probFromDollars(price.high_dollars ?? price.max_dollars ?? price.open_dollars);
-  const low = probFromDollars(price.low_dollars ?? price.min_dollars ?? price.open_dollars);
-  const close = probFromDollars(price.close_dollars ?? price.open_dollars);
+  const yesBid = candle.yes_bid ?? {};
+  const yesAsk = candle.yes_ask ?? {};
+
+  const priceOpen = probFromDollars(price.open_dollars);
+  const priceHigh = probFromDollars(price.high_dollars ?? price.max_dollars);
+  const priceLow = probFromDollars(price.low_dollars ?? price.min_dollars);
+  const priceClose = probFromDollars(price.close_dollars);
+  const previous = probFromDollars(price.previous_dollars);
+
+  const bidOpen = probFromSide(yesBid, 'open_dollars');
+  const bidHigh = probFromSide(yesBid, 'high_dollars');
+  const bidLow = probFromSide(yesBid, 'low_dollars');
+  const bidClose = probFromSide(yesBid, 'close_dollars');
+
+  const askOpen = probFromSide(yesAsk, 'open_dollars');
+  const askHigh = probFromSide(yesAsk, 'high_dollars');
+  const askLow = probFromSide(yesAsk, 'low_dollars');
+  const askClose = probFromSide(yesAsk, 'close_dollars');
+
+  const close = priceClose ?? midOr(bidClose, askClose) ?? previous;
+  const open = priceOpen ?? midOr(bidOpen, askOpen) ?? previous ?? close;
 
   if (close == null && open == null) {
     return null;
   }
+
+  const highs = [priceHigh, bidHigh, askHigh].filter((v) => v != null);
+  const lows = [priceLow, bidLow, askLow].filter((v) => v != null);
+
+  const finalOpen = open ?? close;
+  const finalClose = close ?? open;
+  const high = highs.length
+    ? Math.max(...highs, finalOpen, finalClose)
+    : Math.max(finalOpen, finalClose);
+  const low = lows.length
+    ? Math.min(...lows, finalOpen, finalClose)
+    : Math.min(finalOpen, finalClose);
 
   const volume = Number(candle.volume_fp ?? 0);
   const ts = new Date(Number(candle.end_period_ts) * 1000).toISOString();
 
   return {
     ts,
-    open: open ?? close,
-    high: high ?? close ?? open,
-    low: low ?? close ?? open,
-    close: close ?? open,
+    open: finalOpen,
+    high,
+    low,
+    close: finalClose,
     volume: Number.isNaN(volume) ? 0 : volume,
     trade_count: 0,
   };
@@ -88,23 +128,36 @@ async function loadIngestionState(marketIds) {
 
 async function fetchCandlesForTickers(tickers, startTs, endTs, periodInterval) {
   const results = new Map();
+  for (const ticker of tickers) {
+    results.set(ticker, []);
+  }
+
+  const timeWindows = splitTimeWindowsForCandles(
+    startTs,
+    endTs,
+    periodInterval,
+    tickers.length
+  );
 
   for (const batch of chunkArray(tickers, KALSHI_HISTORY_BATCH_SIZE)) {
-    const markets = await fetchBatchCandlesticks({
-      marketTickers: batch,
-      startTs,
-      endTs,
-      periodInterval,
-    });
+    for (const { startTs: windowStart, endTs: windowEnd } of timeWindows) {
+      const markets = await fetchBatchCandlesticks({
+        marketTickers: batch,
+        startTs: windowStart,
+        endTs: windowEnd,
+        periodInterval,
+      });
 
-    for (const entry of markets) {
-      const mapped = (entry.candlesticks ?? [])
-        .map(mapKalshiCandlestick)
-        .filter(Boolean);
-      results.set(entry.market_ticker, mapped);
+      for (const entry of markets) {
+        const mapped = (entry.candlesticks ?? [])
+          .map(mapKalshiCandlestick)
+          .filter(Boolean);
+        const existing = results.get(entry.market_ticker) ?? [];
+        results.set(entry.market_ticker, existing.concat(mapped));
+      }
+
+      await sleep(REQUEST_DELAY_MS);
     }
-
-    await sleep(REQUEST_DELAY_MS);
   }
 
   return results;
@@ -238,7 +291,7 @@ async function poll() {
   const stateByMarket = await loadIngestionState(hotMarkets.map((m) => m.id));
   let rowsWritten = 0;
 
-  for (const batch of chunkArray(hotMarkets, KALSHI_HISTORY_BATCH_SIZE)) {
+  for (const batch of chunkArray(hotMarkets, 1)) {
     try {
       rowsWritten += await backfillMarketGroup(batch, stateByMarket);
     } catch (err) {

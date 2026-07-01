@@ -31,6 +31,14 @@ function toMs(ts) {
   return typeof ts === 'number' ? ts : new Date(ts).getTime();
 }
 
+/** Kalshi WS uses Unix seconds; normalize to epoch ms. */
+function normalizeEpochMs(ts, fallback = Date.now()) {
+  if (ts == null) return fallback;
+  const n = Number(ts);
+  if (Number.isNaN(n)) return fallback;
+  return n < 1e12 ? n * 1000 : n;
+}
+
 function floorToBucket(ts, intervalMs) {
   const t = toMs(ts);
   return Math.floor(t / intervalMs) * intervalMs;
@@ -62,6 +70,18 @@ function applyTick(bucket, price) {
   bucket.high = Math.max(bucket.high, p);
   bucket.low = Math.min(bucket.low, p);
   bucket.close = p;
+  return bucket;
+}
+
+/** Widen OHLC using bid/ask quotes so quiet minutes still show a spread. */
+function applyQuote(bucket, bid, ask) {
+  if (!bucket) return bucket;
+  for (const raw of [bid, ask]) {
+    if (raw == null || Number.isNaN(Number(raw))) continue;
+    const p = Number(raw);
+    bucket.high = Math.max(bucket.high, p);
+    bucket.low = Math.min(bucket.low, p);
+  }
   return bucket;
 }
 
@@ -191,8 +211,10 @@ module.exports = {
   AGGREGATION_CHAIN,
   getBucketMs,
   floorToBucket,
+  normalizeEpochMs,
   createBucket,
   applyTick,
+  applyQuote,
   applyTrade,
   computeGapFills,
   shouldEvict,

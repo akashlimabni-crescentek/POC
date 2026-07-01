@@ -11,6 +11,30 @@ const LOOKBACK_SECONDS = {
 /** Incremental poll lookback (seconds) */
 const INCREMENTAL_LOOKBACK_SECONDS = 2 * 60 * 60;
 
+/** Kalshi GET /markets/candlesticks — max candlesticks per request (API limit 10000) */
+const KALSHI_MAX_CANDLES_PER_REQUEST = 9000;
+
+function splitTimeWindowsForCandles(startTs, endTs, periodMinutes, tickerCount = 1) {
+  const perTicker = Math.max(
+    1,
+    Math.floor(KALSHI_MAX_CANDLES_PER_REQUEST / Math.max(1, tickerCount))
+  );
+  const chunkSec = perTicker * periodMinutes * 60;
+  const windows = [];
+  let start = startTs;
+
+  while (start < endTs) {
+    const end = Math.min(endTs, start + chunkSec);
+    windows.push({ startTs: start, endTs: end });
+    if (end <= start) {
+      break;
+    }
+    start = end;
+  }
+
+  return windows;
+}
+
 function getFetchWindow(isFirstBackfill, interval) {
   const nowSec = Math.floor(Date.now() / 1000);
   if (isFirstBackfill) {
@@ -66,7 +90,9 @@ function chunkArray(items, size) {
 module.exports = {
   LOOKBACK_SECONDS,
   INCREMENTAL_LOOKBACK_SECONDS,
+  KALSHI_MAX_CANDLES_PER_REQUEST,
   getFetchWindow,
+  splitTimeWindowsForCandles,
   toCandleRows,
   maxCandleTs,
   mergeLastCandleTs,

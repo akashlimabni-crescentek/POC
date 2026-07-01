@@ -11,15 +11,26 @@ import type { CandleRow } from './types';
 export type ChartCandle = CandlestickData<UTCTimestamp>;
 
 export function toChartCandles(rows: CandleRow[]): ChartCandle[] {
-  return rows
-    .filter((row) => row.open != null && row.high != null && row.low != null && row.close != null)
-    .map((row) => ({
-      time: Math.floor(Date.parse(row.ts) / 1000) as UTCTimestamp,
+  const byTime = new Map<number, ChartCandle>();
+
+  for (const row of rows) {
+    if (row.open == null || row.high == null || row.low == null || row.close == null) {
+      continue;
+    }
+
+    const time = Math.floor(Date.parse(row.ts) / 1000);
+    if (Number.isNaN(time)) continue;
+
+    byTime.set(time, {
+      time: time as UTCTimestamp,
       open: Number(row.open),
       high: Number(row.high),
       low: Number(row.low),
       close: Number(row.close),
-    }));
+    });
+  }
+
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
 export type CandlestickChartHandle = {
@@ -47,6 +58,9 @@ export function createCandlestickChart(
     },
     rightPriceScale: {
       borderColor: '#30363d',
+    },
+    localization: {
+      priceFormatter: (price: number) => `${(price * 100).toFixed(1)}%`,
     },
     timeScale: {
       borderColor: '#30363d',

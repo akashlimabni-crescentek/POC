@@ -8,6 +8,7 @@ const { KALSHI } = require('../../config/providers');
 const { KALSHI_EVENTS_POLL_MS } = require('../../config/intervals');
 const { loadKalshiCredentials } = require('../../config/kalshi-key');
 const { fetchMarketsPaginated } = require('../../lib/kalshi-client');
+const { discoverWorldCupSeries } = require('../../lib/kalshi-wc-series');
 const { upsertBatched } = require('../../lib/bulk-upsert');
 const { DeadLetterQueue } = require('../../lib/dead-letter');
 const { createGuardedInterval } = require('../../lib/guarded-interval');
@@ -23,6 +24,11 @@ let lastPollTs = null;
 
 let cachedProviderId = null;
 
+/** Cached World Cup series from /series discovery (refreshed every 6h) */
+let cachedDiscoveredSeries = null;
+let seriesDiscoveredAt = 0;
+const SERIES_REDISCOVER_MS = 6 * 60 * 60 * 1000;
+
 function validateEnv() {
   if (!process.env.SUPABASE_URL?.trim()) {
     throw new Error(`[${WORKER_NAME}] SUPABASE_URL is required`);
@@ -33,14 +39,39 @@ function validateEnv() {
   loadKalshiCredentials();
 }
 
-function getSeriesTickers() {
+function parseSeriesTickersFromEnv() {
   const fromEnv = process.env.KALSHI_SERIES_TICKERS?.split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  if (fromEnv?.length) {
+  return fromEnv ?? [];
+}
+
+function getSeriesTickers() {
+  return parseSeriesTickersFromEnv();
+}
+
+async function resolveSeriesTickers() {
+  const fromEnv = parseSeriesTickersFromEnv();
+
+  // Use explicit env list unless set to "auto" (World Cup discovery — legacy worker3 behaviour)
+  if (fromEnv.length > 0 && fromEnv[0].toLowerCase() !== 'auto') {
     return fromEnv;
   }
-  return KALSHI.seriesTickers ?? [];
+
+  const now = Date.now();
+  if (cachedDiscoveredSeries && now - seriesDiscoveredAt < SERIES_REDISCOVER_MS) {
+    return cachedDiscoveredSeries;
+  }
+
+  console.log(`[${WORKER_NAME}] discovering FIFA World Cup series from Kalshi /series API...`);
+  const discovered = await discoverWorldCupSeries();
+  cachedDiscoveredSeries = discovered;
+  seriesDiscoveredAt = now;
+
+  console.log(
+    `[${WORKER_NAME}] discovered ${discovered.length} World Cup series: ${discovered.join(', ')}`
+  );
+  return discovered;
 }
 
 function filterByConfiguredSeries(markets, seriesTickers) {
@@ -154,7 +185,6 @@ async function getProviderId() {
 }
 
 async function fetchMarketsCold(seriesTickers) {
-  console.log('fetching markets cold', seriesTickers, Date.now());
   if (seriesTickers.length === 0) {
     return fetchMarketsPaginated({ status: 'open' });
   }
@@ -255,41 +285,51 @@ async function persistPollWatermark(providerId, marketRows, pollStartedAtSec) {
     return;
   }
 
-  const { data: dbMarkets, error } = await supabase
-    .from('markets')
-    .select('id, external_id')
-    .eq('provider_id', providerId)
-    .in(
-      'external_id',
-      marketRows.map((m) => m.external_id)
-    );
+  const externalIds = marketRows.map((m) => m.external_id);
+  const dbMarkets = [];
+  const chunkSize = 100;
 
-  if (error) {
-    console.error(`[${WORKER_NAME}] persistPollWatermark lookup: ${error.message}`);
+  for (let i = 0; i < externalIds.length; i += chunkSize) {
+    const chunk = externalIds.slice(i, i + chunkSize);
+    const { data, error } = await supabase
+      .from('markets')
+      .select('id, external_id')
+      .eq('provider_id', providerId)
+      .in('external_id', chunk);
+
+    if (error) {
+      console.error(`[${WORKER_NAME}] persistPollWatermark lookup: ${error.message}`);
+      continue;
+    }
+    dbMarkets.push(...(data ?? []));
+  }
+
+  if (dbMarkets.length === 0) {
     return;
   }
 
   const pollIso = new Date(pollStartedAtSec * 1000).toISOString();
-  const stateRows = (dbMarkets ?? []).map((m) => ({
+  const stateRows = dbMarkets.map((m) => ({
     market_id: m.id,
     tier: marketRows.find((r) => r.external_id === m.external_id)?.ingestion_tier ?? 'warm',
     last_poll_ts: pollIso,
   }));
 
-  const { error: upsertError } = await supabase
-    .from('market_ingestion_state')
-    .upsert(stateRows, { onConflict: 'market_id' });
+  for (let i = 0; i < stateRows.length; i += chunkSize) {
+    const chunk = stateRows.slice(i, i + chunkSize);
+    const { error: upsertError } = await supabase
+      .from('market_ingestion_state')
+      .upsert(chunk, { onConflict: 'market_id' });
 
-  if (upsertError) {
-    console.error(`[${WORKER_NAME}] persistPollWatermark: ${upsertError.message}`);
+    if (upsertError) {
+      console.error(`[${WORKER_NAME}] persistPollWatermark: ${upsertError.message}`);
+    }
   }
 }
 
 async function poll() {
-  console.log('poll executed', Date.now());
   const providerId = await getProviderId();
-  const seriesTickers = getSeriesTickers();
-  console.log('seriesTickers', seriesTickers, Date.now());
+  const seriesTickers = await resolveSeriesTickers();
   const pollStartedAtSec = Math.floor(Date.now() / 1000);
   let rowsWritten = 0;
 
@@ -299,16 +339,13 @@ async function poll() {
   let markets;
 
   if (isFirstPoll) {
-    console.log('fetching markets cold', Date.now());
     markets = await fetchMarketsCold(seriesTickers);
   } else {
     if (lastPollTs == null) {
       throw new Error(`[${WORKER_NAME}] warm poll requires lastPollTs`);
     }
     markets = await fetchUpdatedMarkets(lastPollTs);
-    console.log('markets fetched', markets.length, Date.now());
     markets = filterByConfiguredSeries(markets, seriesTickers);
-    console.log('markets filtered', markets.length, Date.now());
   }
 
   const grouped = groupMarketsByEvent(markets);
@@ -386,6 +423,12 @@ function start() {
   console.log(
     `[${WORKER_NAME}] starting — poll every ${KALSHI_EVENTS_POLL_MS / 60_000}m (cold then warm)`
   );
+
+  // Refresh discovered World Cup series periodically (legacy worker3 behaviour)
+  setInterval(() => {
+    cachedDiscoveredSeries = null;
+  }, SERIES_REDISCOVER_MS);
+
   return startInterval();
 }
 
@@ -397,6 +440,7 @@ module.exports = {
   start,
   poll,
   getSeriesTickers,
+  resolveSeriesTickers,
   filterByConfiguredSeries,
   mapMarketStatus,
   mapEventStatus,
@@ -409,5 +453,7 @@ module.exports = {
   _resetPollState: () => {
     isFirstPoll = true;
     lastPollTs = null;
+    cachedDiscoveredSeries = null;
+    seriesDiscoveredAt = 0;
   },
 };

@@ -27,7 +27,7 @@ const LIVE_FLUSH_MS = 1_000;
 const CANDLE_1M_FLUSH_MS = 60_000;
 
 /** History backfill cycle (hot markets only) */
-const HISTORY_POLL_MS = 15 * 60_000;
+const HISTORY_POLL_MS = 1 * 60_000;
 
 /** Maintenance / retention fallback worker */
 const MAINTENANCE_POLL_MS = 60 * 60_000;

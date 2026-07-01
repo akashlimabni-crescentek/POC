@@ -54,6 +54,18 @@ describe('kalshi/live-ws', () => {
     expect(lastSeqBySid.get(1)).toBe(6);
   });
 
+  it('collectCompletedCandles handles Kalshi ts in seconds without runaway loop', () => {
+    const intervalMs = getBucketMs('1m');
+    const nowMs = Date.parse('2026-07-01T12:00:00Z');
+    const state = createTickerState(42);
+    const tsSec = Math.floor(nowMs / 1000) - 120;
+    updateSnapshot(state, { bid: 0.4, ask: 0.6, last: 0.5, ts: tsSec });
+
+    const rows = collectCompletedCandles(new Map([['T', state]]), nowMs);
+    expect(rows.length).toBeLessThan(200);
+    expect(state.bucketStartMs).toBeGreaterThan(1e12);
+  });
+
   it('collectCompletedCandles emits 1m rows', () => {
     const intervalMs = getBucketMs('1m');
     const start = floorToBucket(Date.parse('2026-01-01T00:00:00Z'), intervalMs);
@@ -69,6 +81,7 @@ describe('kalshi/live-ws', () => {
       trade_count: 2,
     };
     state.lastKnownClose = 0.51;
+    state.bucketHadActivity = true;
 
     const rows = collectCompletedCandles(new Map([['T', state]]), start + intervalMs + 1);
     expect(rows[0].market_id).toBe(42);
@@ -80,6 +93,14 @@ describe('kalshi/live-ws', () => {
     updateSnapshot(state, { bid: 0.4, ask: 0.6, last: 0.55, ts: Date.now() });
     expect(state.pendingSnapshot.market_id).toBe(7);
     expect(state.pendingSnapshot.mid).toBe(0.5);
+  });
+
+  it('updateSnapshot widens OHLC using bid/ask spread', () => {
+    const state = createTickerState(7);
+    updateSnapshot(state, { bid: 0.92, ask: 0.93, last: 0.925, ts: Date.now() });
+    expect(state.bucket.high).toBe(0.93);
+    expect(state.bucket.low).toBe(0.92);
+    expect(state.bucket.close).toBe(0.925);
   });
 });
 

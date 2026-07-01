@@ -32,11 +32,12 @@ export async function getProviders(supabase: SupabaseClient): Promise<Provider[]
 export async function getEvents(
   supabase: SupabaseClient,
   providerSlug: string,
-  options: { page?: number; limit?: number } = {}
+  options: { page?: number; limit?: number; search?: string } = {}
 ): Promise<{ events: EventRow[]; total: number }> {
   const page = Math.max(1, options.page ?? 1);
   const limit = options.limit ?? DEFAULT_PAGE_SIZE;
   const offset = (page - 1) * limit;
+  const search = options.search?.trim() ?? '';
 
   const { data: provider, error: providerError } = await supabase
     .from('providers')
@@ -52,12 +53,18 @@ export async function getEvents(
     return { events: [], total: 0 };
   }
 
-  const { data, error, count } = await supabase
+  let query = supabase
     .from('events')
     .select('id, provider_id, external_id, title, slug, category, close_time, status, updated_at', {
       count: 'exact',
     })
-    .eq('provider_id', provider.id)
+    .eq('provider_id', provider.id);
+
+  if (search) {
+    query = query.ilike('title', `%${search}%`);
+  }
+
+  const { data, error, count } = await query
     .order('updated_at', { ascending: false })
     .range(offset, offset + limit - 1);
 

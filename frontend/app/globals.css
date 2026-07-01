@@ -134,6 +134,35 @@ main {
   color: #58a6ff;
 }
 
+.search-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+  align-items: center;
+}
+
+.search-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 0.55rem 0.85rem;
+  border-radius: 8px;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  color: #e6edf3;
+  font-size: 0.9375rem;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: #58a6ff;
+  box-shadow: 0 0 0 2px #58a6ff33;
+}
+
+.search-input::placeholder {
+  color: #6e7681;
+}
+
 .pagination {
   display: flex;
   align-items: center;

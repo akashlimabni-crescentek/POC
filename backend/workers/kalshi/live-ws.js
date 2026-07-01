@@ -24,15 +24,18 @@ const {
   floorToBucket,
   createBucket,
   applyTick,
+  applyQuote,
   applyTrade,
-  computeGapFills,
   shouldEvict,
+  normalizeEpochMs,
 } = require('../../lib/ohlc');
 
 const WORKER_NAME = 'kalshi/live-ws';
 const INTERVAL_1M_MS = getBucketMs('1m');
 const SUBSCRIBE_CHANNELS = ['ticker', 'trade'];
 const TICKER_CHUNK_SIZE = 100;
+/** Safety cap — max 1m buckets closed per ticker per flush (2h catch-up) */
+const MAX_BUCKETS_PER_FLUSH = 120;
 
 /** Kalshi WS prices normalized to 0–1 probability on write */
 function extractKalshiPrices(payload) {
@@ -89,6 +92,7 @@ function createTickerState(marketId) {
     marketId,
     bucket: null,
     bucketStartMs: null,
+    bucketHadActivity: false,
     lastKnownClose: null,
     lastRealTickAt: null,
     lastWrittenBucketMs: null,
@@ -105,6 +109,7 @@ function ensureBucket(state, price, nowMs = Date.now()) {
   if (!state.bucket || state.bucketStartMs !== bucketStart) {
     state.bucket = createBucket(bucketStart, p);
     state.bucketStartMs = bucketStart;
+    state.bucketHadActivity = false;
   }
 }
 
@@ -113,16 +118,19 @@ function updateSnapshot(state, { bid, ask, last, ts }) {
   const price = mid ?? last ?? bid ?? ask;
   if (price == null) return;
 
-  state.lastRealTickAt = ts ?? Date.now();
+  const tickMs = normalizeEpochMs(ts);
+  state.lastRealTickAt = tickMs;
   state.lastKnownClose = price;
   state.lastPrice = last ?? price;
 
-  ensureBucket(state, price, state.lastRealTickAt);
+  ensureBucket(state, price, tickMs);
   applyTick(state.bucket, price);
+  applyQuote(state.bucket, bid, ask);
+  state.bucketHadActivity = true;
 
   state.pendingSnapshot = {
     market_id: state.marketId,
-    ts: new Date(state.lastRealTickAt).toISOString(),
+    ts: new Date(tickMs).toISOString(),
     bid,
     ask,
     mid,
@@ -137,40 +145,40 @@ function collectCompletedCandles(tickerStates, nowMs = Date.now()) {
   for (const state of tickerStates.values()) {
     if (!state.bucket || state.bucketStartMs == null) continue;
 
-    while (state.bucketStartMs + INTERVAL_1M_MS <= nowMs) {
-      rows.push({
-        market_id: state.marketId,
-        interval: '1m',
-        ts: state.bucket.ts,
-        open: state.bucket.open,
-        high: state.bucket.high,
-        low: state.bucket.low,
-        close: state.bucket.close,
-        volume: state.bucket.volume,
-        trade_count: state.bucket.trade_count,
-      });
+    let iterations = 0;
+    while (
+      state.bucketStartMs + INTERVAL_1M_MS <= nowMs &&
+      iterations < MAX_BUCKETS_PER_FLUSH
+    ) {
+      iterations += 1;
 
-      const { fills } = computeGapFills(
-        state.lastWrittenBucketMs,
-        state.bucketStartMs,
-        state.lastKnownClose,
-        INTERVAL_1M_MS
-      );
-
-      for (const fill of fills) {
+      if (state.bucketHadActivity) {
         rows.push({
           market_id: state.marketId,
           interval: '1m',
-          ...fill,
+          ts: state.bucket.ts,
+          open: state.bucket.open,
+          high: state.bucket.high,
+          low: state.bucket.low,
+          close: state.bucket.close,
+          volume: state.bucket.volume,
+          trade_count: state.bucket.trade_count,
         });
       }
 
       state.lastWrittenBucketMs = state.bucketStartMs;
+      state.bucketHadActivity = false;
       const nextStart = state.bucketStartMs + INTERVAL_1M_MS;
       const carry = state.bucket.close;
       state.lastKnownClose = carry;
       state.bucket = createBucket(nextStart, carry);
       state.bucketStartMs = nextStart;
+    }
+
+    if (iterations >= MAX_BUCKETS_PER_FLUSH) {
+      console.warn(
+        `[${WORKER_NAME}] candle catch-up capped for market=${state.marketId} (${MAX_BUCKETS_PER_FLUSH} buckets)`
+      );
     }
   }
 
@@ -283,6 +291,12 @@ class KalshiLiveWorker {
 
     this.tickerToMarket = nextMap;
 
+    for (const ticker of this.tickerStates.keys()) {
+      if (!nextTickers.has(ticker)) {
+        this.tickerStates.delete(ticker);
+      }
+    }
+
     if (this.ws?.readyState === WebSocket.OPEN) {
       if (isInitial) {
         this.subscribeTickers([...nextTickers]);
@@ -316,7 +330,7 @@ class KalshiLiveWorker {
     if (!state) return;
 
     const { bid, ask, last } = extractKalshiPrices(payload);
-    const ts = payload.ts ? Number(payload.ts) : Date.now();
+    const ts = normalizeEpochMs(payload.ts);
     updateSnapshot(state, { bid, ask, last, ts });
   }
 
@@ -328,7 +342,7 @@ class KalshiLiveWorker {
 
     const { last: price } = extractKalshiPrices(payload);
     const size = payload.count ?? payload.size ?? 0;
-    const ts = payload.ts ? Number(payload.ts) : Date.now();
+    const ts = normalizeEpochMs(payload.ts);
 
     if (price == null) return;
 
@@ -441,12 +455,17 @@ class KalshiLiveWorker {
 
   connect() {
     if (this.ws) {
-      this.ws.removeAllListeners();
+      const stale = this.ws;
+      stale.on('error', () => {});
+      stale.removeAllListeners('open');
+      stale.removeAllListeners('message');
+      stale.removeAllListeners('close');
       try {
-        this.ws.terminate();
+        stale.terminate();
       } catch {
         // ignore
       }
+      this.ws = null;
     }
 
     const headers = buildWsAuthHeaders();

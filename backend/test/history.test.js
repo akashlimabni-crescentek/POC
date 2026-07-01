@@ -13,6 +13,14 @@ describe('history-common', () => {
     expect(first.endTs - first.startTs).toBeGreaterThan(inc.endTs - inc.startTs);
   });
 
+  it('splitTimeWindowsForCandles respects Kalshi 10k candlestick cap', () => {
+    const { splitTimeWindowsForCandles } = require('../lib/history-common');
+    const startTs = 0;
+    const endTs = 7 * 24 * 60 * 60; // 7 days
+    const windows = splitTimeWindowsForCandles(startTs, endTs, 1, 4);
+    expect(windows.length).toBeGreaterThan(1);
+  });
+
   it('mergeLastCandleTs keeps max timestamp per interval', () => {
     const merged = mergeLastCandleTs(
       { '1m': '2026-01-01T00:00:00Z' },
@@ -62,5 +70,30 @@ describe('kalshi/history', () => {
     expect(candle.open).toBe(0.4);
     expect(candle.close).toBe(0.5);
     expect(candle.volume).toBe(12);
+  });
+
+  it('mapKalshiCandlestick uses yes_bid/yes_ask when trade price OHLC is missing', () => {
+    const candle = mapKalshiCandlestick({
+      end_period_ts: 1782900000,
+      price: { previous_dollars: '0.9200' },
+      volume_fp: '0.00',
+      yes_bid: {
+        close_dollars: '0.9200',
+        high_dollars: '0.9200',
+        low_dollars: '0.9200',
+        open_dollars: '0.9200',
+      },
+      yes_ask: {
+        close_dollars: '0.9300',
+        high_dollars: '0.9400',
+        low_dollars: '0.9300',
+        open_dollars: '0.9400',
+      },
+    });
+
+    expect(candle.open).toBeCloseTo(0.93);
+    expect(candle.close).toBeCloseTo(0.925);
+    expect(candle.high).toBe(0.94);
+    expect(candle.low).toBe(0.92);
   });
 });
