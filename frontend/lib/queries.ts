@@ -1,0 +1,177 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
+import { createBrowserClient } from './supabase/client';
+import { pickRelation } from './utils';
+import type {
+  CandleInterval,
+  CandleRow,
+  EventRow,
+  MarketPriceLatest,
+  MarketRow,
+  Provider,
+} from './types';
+
+const DEFAULT_PAGE_SIZE = 50;
+
+const CANDLE_LOOKBACK_MS: Record<CandleInterval, number> = {
+  '1m': 7 * 24 * 60 * 60 * 1000,
+  '5m': 30 * 24 * 60 * 60 * 1000,
+  '1h': 90 * 24 * 60 * 60 * 1000,
+  '1d': 365 * 24 * 60 * 60 * 1000,
+};
+
+export async function getProviders(supabase: SupabaseClient): Promise<Provider[]> {
+  const { data, error } = await supabase.from('providers').select('id, slug, name').order('id');
+
+  if (error) {
+    throw new Error(`getProviders failed: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
+export async function getEvents(
+  supabase: SupabaseClient,
+  providerSlug: string,
+  options: { page?: number; limit?: number } = {}
+): Promise<{ events: EventRow[]; total: number }> {
+  const page = Math.max(1, options.page ?? 1);
+  const limit = options.limit ?? DEFAULT_PAGE_SIZE;
+  const offset = (page - 1) * limit;
+
+  const { data: provider, error: providerError } = await supabase
+    .from('providers')
+    .select('id')
+    .eq('slug', providerSlug)
+    .maybeSingle();
+
+  if (providerError) {
+    throw new Error(`getEvents provider lookup failed: ${providerError.message}`);
+  }
+
+  if (!provider) {
+    return { events: [], total: 0 };
+  }
+
+  const { data, error, count } = await supabase
+    .from('events')
+    .select('id, provider_id, external_id, title, slug, category, close_time, status, updated_at', {
+      count: 'exact',
+    })
+    .eq('provider_id', provider.id)
+    .order('updated_at', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) {
+    throw new Error(`getEvents failed: ${error.message}`);
+  }
+
+  return { events: data ?? [], total: count ?? 0 };
+}
+
+export async function getEventById(
+  supabase: SupabaseClient,
+  eventId: number
+): Promise<EventRow | null> {
+  const { data, error } = await supabase
+    .from('events')
+    .select(
+      'id, provider_id, external_id, title, slug, category, close_time, status, updated_at, providers(slug, name)'
+    )
+    .eq('id', eventId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`getEventById failed: ${error.message}`);
+  }
+
+  return data;
+}
+
+export async function getEventMarkets(
+  supabase: SupabaseClient,
+  eventId: number
+): Promise<MarketRow[]> {
+  const { data, error } = await supabase
+    .from('markets')
+    .select(
+      'id, event_id, provider_id, external_id, title, outcome_label, status, close_time, ingestion_tier, market_prices_latest(*)'
+    )
+    .eq('event_id', eventId)
+    .order('id');
+
+  if (error) {
+    throw new Error(`getEventMarkets failed: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
+export async function getMarketById(
+  supabase: SupabaseClient,
+  marketId: number
+): Promise<MarketRow | null> {
+  const { data, error } = await supabase
+    .from('markets')
+    .select(
+      'id, event_id, provider_id, external_id, title, outcome_label, status, close_time, ingestion_tier, market_prices_latest(*), events(id, title), providers(slug, name)'
+    )
+    .eq('id', marketId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`getMarketById failed: ${error.message}`);
+  }
+
+  return data;
+}
+
+/**
+ * Index-friendly candle query: market_id + interval + ts range.
+ */
+export async function getCandles(
+  supabase: SupabaseClient,
+  marketId: number,
+  interval: CandleInterval,
+  from?: string,
+  to?: string
+): Promise<CandleRow[]> {
+  const now = Date.now();
+  const fromIso =
+    from ?? new Date(now - CANDLE_LOOKBACK_MS[interval]).toISOString();
+  const toIso = to ?? new Date(now).toISOString();
+
+  const { data, error } = await supabase
+    .from('candles')
+    .select('market_id, interval, ts, open, high, low, close, volume, trade_count')
+    .eq('market_id', marketId)
+    .eq('interval', interval)
+    .gte('ts', fromIso)
+    .lte('ts', toIso)
+    .order('ts', { ascending: true });
+
+  if (error) {
+    throw new Error(`getCandles failed: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
+/**
+ * Promote all active/open markets for an event to hot tier (browser only).
+ */
+export async function promoteEventToHot(eventId: number): Promise<void> {
+  const supabase = createBrowserClient();
+  const { error } = await supabase.rpc('promote_event_to_hot', {
+    p_event_id: eventId,
+  });
+
+  if (error) {
+    throw new Error(`promote_event_to_hot failed: ${error.message}`);
+  }
+}
+
+export function pickLatestPrice(market: {
+  market_prices_latest?: MarketPriceLatest | MarketPriceLatest[] | null;
+}): MarketPriceLatest | null {
+  return pickRelation(market.market_prices_latest);
+}

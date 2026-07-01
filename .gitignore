@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets — NEVER commit
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
+
+# Keys
+*.pem
+*.key
+
+# OS
+.DS_Store
+
+# Build outputs
+.next/
+dist/
+out/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Supabase local
+.supabase/
+
+# Test / coverage
+coverage/

@@ -1,0 +1,21 @@
+{
+  "name": "prediction-market-poc",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev:migrate": "supabase db push",
+    "dev:workers": "npm run validate:env -- --backend-only --kalshi && concurrently -k -n poly:events,kalshi:events,poly:live,kalshi:live,poly:history,kalshi:history,maintenance -c blue,green,cyan,magenta,yellow,red,gray \"npm run worker:poly:events -w backend\" \"npm run worker:kalshi:events -w backend\" \"npm run worker:poly:live -w backend\" \"npm run worker:kalshi:live -w backend\" \"npm run worker:poly:history -w backend\" \"npm run worker:kalshi:history -w backend\" \"npm run worker:maintenance -w backend\"",
+    "dev:frontend": "npm run validate:env -- --frontend-only && npm run dev -w frontend",
+    "validate:env": "node scripts/validate-env.js",
+    "test": "npm test -w backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "dotenv": "^16.4.7",
+    "supabase": "^2.109.0"
+  }
+}

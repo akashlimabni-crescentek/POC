@@ -1,0 +1,12 @@
+# Supabase local config — migrations applied via `supabase db push` to hosted project.
+# See: https://supabase.com/docs/guides/cli
+
+[project]
+id = "prediction-market-poc"
+
+[api]
+enabled = true
+
+[db]
+port = 54322
+major_version = 15
