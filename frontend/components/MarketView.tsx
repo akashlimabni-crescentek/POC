@@ -4,12 +4,19 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createBrowserClient } from '@/lib/supabase/client';
 import { getCandles } from '@/lib/queries';
+import { getMarketDisplayName } from '@/lib/market-label';
+import { aggregateCandles } from '@/lib/candle-aggregate';
+import {
+  OHLCV_INTERVALS,
+  OHLCV_SOURCE,
+  ohlcvRangeToWindow,
+  type OhlcvInterval,
+} from '@/lib/chart-config';
 import { formatProbability } from '@/lib/chart';
 import { pickProvider, pickRelation } from '@/lib/utils';
-import CandlestickChart from '@/components/CandlestickChart';
-import type { CandleInterval, MarketPriceLatest, MarketRow } from '@/lib/types';
+import OhlcvChart from '@/components/OhlcvChart';
+import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
 
-const INTERVALS: CandleInterval[] = ['1m', '5m', '1h', '1d'];
 const POLL_MS = 2_000;
 const STALE_MS = 30_000;
 
@@ -28,16 +35,26 @@ function isStale(updatedAt: string | null | undefined): boolean {
 }
 
 export default function MarketView({ market }: { market: MarketRow }) {
-  const [interval, setInterval] = useState<CandleInterval>('1m');
-  const [candles, setCandles] = useState<Awaited<ReturnType<typeof getCandles>>>([]);
+  const [ohlcvInterval, setOhlcvInterval] = useState<OhlcvInterval>('5m');
+  const [candles, setCandles] = useState<CandleRow[]>([]);
   const [candlesLoading, setCandlesLoading] = useState(true);
   const [price, setPrice] = useState<MarketPriceLatest | null>(pickPrice(market.market_prices_latest));
+
+  const eventTitle = pickRelation(market.events)?.title ?? null;
+  const displayName = getMarketDisplayName(market, eventTitle);
 
   const loadCandles = useCallback(async () => {
     setCandlesLoading(true);
     try {
       const supabase = createBrowserClient();
-      const rows = await getCandles(supabase, market.id, interval);
+      const config = OHLCV_SOURCE[ohlcvInterval];
+      const { from, to } = ohlcvRangeToWindow(ohlcvInterval);
+      let rows = await getCandles(supabase, market.id, config.sourceInterval, from, to);
+
+      if (config.aggregateMs) {
+        rows = aggregateCandles(rows, config.aggregateMs);
+      }
+
       setCandles(rows);
     } catch (err) {
       console.error('[MarketView] getCandles failed:', err);
@@ -45,7 +62,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
     } finally {
       setCandlesLoading(false);
     }
-  }, [market.id, interval]);
+  }, [market.id, ohlcvInterval]);
 
   const loadPrice = useCallback(async () => {
     const supabase = createBrowserClient();
@@ -100,7 +117,6 @@ export default function MarketView({ market }: { market: MarketRow }) {
     pickProvider(market.providers)?.name ??
     pickProvider(market.providers)?.slug ??
     'Provider';
-  const eventTitle = pickRelation(market.events)?.title;
 
   return (
     <div>
@@ -113,9 +129,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
       <div className="card">
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
           <div>
-            <h1 style={{ margin: '0 0 0.5rem', fontSize: '1.5rem' }}>
-              {market.title ?? market.outcome_label ?? `Market #${market.id}`}
-            </h1>
+            <h1 style={{ margin: '0 0 0.5rem', fontSize: '1.5rem' }}>{displayName}</h1>
             <div className="muted" style={{ fontSize: '0.875rem' }}>
               {providerName}
               {eventTitle ? ` · ${eventTitle}` : ''}
@@ -154,18 +168,21 @@ export default function MarketView({ market }: { market: MarketRow }) {
         )}
       </div>
 
-      <div style={{ marginTop: '1.25rem' }}>
-        <div className="interval-bar">
-          {INTERVALS.map((value) => (
-            <button
-              key={value}
-              type="button"
-              className={`btn ${interval === value ? 'btn-primary' : ''}`}
-              onClick={() => setInterval(value)}
-            >
-              {value}
-            </button>
-          ))}
+      <div className="card" style={{ marginTop: '1.25rem' }}>
+        <div className="chart-toolbar chart-toolbar-compact">
+          <span className="mode-btn mode-btn-active">OHLCV</span>
+          <div className="timeline-bar">
+            {OHLCV_INTERVALS.map((interval) => (
+              <button
+                key={interval}
+                type="button"
+                className={`timeline-btn ${ohlcvInterval === interval ? 'timeline-btn-active' : ''}`}
+                onClick={() => setOhlcvInterval(interval)}
+              >
+                {interval}
+              </button>
+            ))}
+          </div>
         </div>
 
         {candlesLoading && (
@@ -178,7 +195,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
           </div>
         )}
 
-        {!candlesLoading && candles.length > 0 && <CandlestickChart candles={candles} />}
+        {!candlesLoading && candles.length > 0 && <OhlcvChart candles={candles} />}
       </div>
     </div>
   );
