@@ -154,6 +154,7 @@ async function getProviderId() {
 }
 
 async function fetchMarketsCold(seriesTickers) {
+  console.log('fetching markets cold', seriesTickers, Date.now());
   if (seriesTickers.length === 0) {
     return fetchMarketsPaginated({ status: 'open' });
   }
@@ -285,8 +286,10 @@ async function persistPollWatermark(providerId, marketRows, pollStartedAtSec) {
 }
 
 async function poll() {
+  console.log('poll executed', Date.now());
   const providerId = await getProviderId();
   const seriesTickers = getSeriesTickers();
+  console.log('seriesTickers', seriesTickers, Date.now());
   const pollStartedAtSec = Math.floor(Date.now() / 1000);
   let rowsWritten = 0;
 
@@ -296,13 +299,16 @@ async function poll() {
   let markets;
 
   if (isFirstPoll) {
+    console.log('fetching markets cold', Date.now());
     markets = await fetchMarketsCold(seriesTickers);
   } else {
     if (lastPollTs == null) {
       throw new Error(`[${WORKER_NAME}] warm poll requires lastPollTs`);
     }
     markets = await fetchUpdatedMarkets(lastPollTs);
+    console.log('markets fetched', markets.length, Date.now());
     markets = filterByConfiguredSeries(markets, seriesTickers);
+    console.log('markets filtered', markets.length, Date.now());
   }
 
   const grouped = groupMarketsByEvent(markets);
