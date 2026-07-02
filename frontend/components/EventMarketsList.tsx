@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createBrowserClient } from '@/lib/supabase/client';
 import { pickLatestPrice } from '@/lib/queries';
 import { getMarketDisplayName } from '@/lib/market-label';
@@ -24,9 +24,21 @@ export default function EventMarketsList({ eventTitle, markets: initialMarkets }
     setMarkets(initialMarkets);
   }, [initialMarkets]);
 
+  const marketIdsKey = useMemo(
+    () => initialMarkets.map((market) => market.id).join(','),
+    [initialMarkets]
+  );
+
+  const marketIds = useMemo(
+    () => initialMarkets.map((market) => market.id),
+    [marketIdsKey]
+  );
+
   useEffect(() => {
     const supabase = createBrowserClient();
-    const marketIds = initialMarkets.map((market) => market.id);
+    if (!marketIds.length) {
+      return;
+    }
 
     const unsubscribePrices = subscribeMarketPricesMany(
       supabase,
@@ -61,7 +73,7 @@ export default function EventMarketsList({ eventTitle, markets: initialMarkets }
       unsubscribePrices();
       unsubscribeIngestion();
     };
-  }, [initialMarkets]);
+  }, [marketIdsKey, marketIds]);
 
   if (!markets.length) {
     return (

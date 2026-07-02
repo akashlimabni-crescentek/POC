@@ -3,98 +3,80 @@ import type { LiveTickRow, MarketIngestionStateRow, MarketPriceLatest } from './
 
 export type RealtimeUnsubscribe = () => void;
 
+const LOG = '[WebSocket]';
+
 type PostgresHandler<T> = (row: T) => void;
 
-const LOG_PREFIX = '[realtime]';
-
-function realtimeApiUrl(): string {
-  const base = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim().replace(/\/$/, '');
-  return base ? `${base}/realtime/v1/websocket` : 'unknown';
-}
-
-function logChannelStatus(
-  channelName: string,
-  table: string,
-  marketIds: number[],
-  status: string,
-  err?: Error
-): void {
-  const api = realtimeApiUrl();
-  const meta = { api, channel: channelName, table, marketIds };
-
-  if (status === 'SUBSCRIBED') {
-    console.log(`${LOG_PREFIX} WebSocket connected`, meta);
-    return;
-  }
-
-  if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-    console.error(`${LOG_PREFIX} WebSocket failed`, { ...meta, status, error: err?.message });
-    return;
-  }
-
-  if (status === 'CLOSED') {
-    console.log(`${LOG_PREFIX} WebSocket closed`, meta);
-  }
-}
-
-function logRealtimeData(
-  table: string,
-  payload: { eventType?: string; new: Record<string, unknown> }
-): void {
-  const row = payload.new;
-  const receivedAt = new Date().toISOString();
-
-  const base = {
-    source: 'realtime-push',
-    table,
-    event: payload.eventType ?? 'UNKNOWN',
-    market_id: row.market_id,
-    receivedAt,
-  };
-
-  if (table === 'market_prices_latest') {
-    console.log(`${LOG_PREFIX} live data received (no page refresh)`, {
-      ...base,
-      last_price: row.last_price,
-      mid: row.mid,
-      bid: row.bid,
-      ask: row.ask,
-      updated_at: row.updated_at,
-    });
-    return;
-  }
-
-  if (table === 'live_ticks') {
-    console.log(`${LOG_PREFIX} live data received (no page refresh)`, {
-      ...base,
-      ts: row.ts,
-      last_price: row.last_price,
-      mid: row.mid,
-    });
-    return;
-  }
-
-  if (table === 'market_ingestion_state') {
-    console.log(`${LOG_PREFIX} live data received (no page refresh)`, {
-      ...base,
-      tier: row.tier,
-      last_backfill_at: row.last_backfill_at,
-      last_poll_ts: row.last_poll_ts,
-    });
-  }
-}
+type RealtimePayload = {
+  eventType?: string;
+  schema?: string;
+  table?: string;
+  new: unknown;
+  old?: unknown;
+};
 
 function handlePayload<T extends { market_id: number }>(
+  channelName: string,
   table: string,
-  payload: { eventType?: string; new: unknown },
+  payload: RealtimePayload,
   onUpdate: PostgresHandler<T>
 ): void {
   if (!payload.new || typeof payload.new !== 'object') {
     return;
   }
 
-  logRealtimeData(table, payload as { eventType?: string; new: Record<string, unknown> });
-  onUpdate(payload.new as T);
+  const row = payload.new as T;
+
+  console.log(`${LOG} data received`, {
+    table,
+    channel: channelName,
+    event: payload.eventType ?? 'UNKNOWN',
+    schema: payload.schema ?? 'public',
+    market_id: row.market_id,
+    receivedAt: new Date().toISOString(),
+    data: row,
+    previous: payload.old ?? null,
+  });
+
+  onUpdate(row);
+}
+
+function realtimeApiUrl(): string {
+  const base = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim().replace(/\/$/, '');
+  return base ? `${base}/realtime/v1/websocket` : 'unknown';
+}
+
+function logSubscribeStatus(
+  table: string,
+  channelName: string,
+  marketIds: number[],
+  status: string,
+  err?: Error
+): void {
+  const subscription = {
+    status,
+    api: realtimeApiUrl(),
+    channel: channelName,
+    table,
+    schema: 'public',
+    event: '*',
+    marketIds,
+    filters: marketIds.map((id) => `market_id=eq.${id}`),
+  };
+
+  if (status === 'SUBSCRIBED') {
+    console.log(`${LOG} subscribed (waiting for data)`, subscription);
+    return;
+  }
+
+  if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+    console.error(`${LOG} subscription failed`, { ...subscription, error: err?.message });
+    return;
+  }
+
+  if (status === 'CLOSED') {
+    console.log(`${LOG} closed`, subscription);
+  }
 }
 
 function subscribeTable<T extends { market_id: number }>(
@@ -115,15 +97,22 @@ function subscribeTable<T extends { market_id: number }>(
         filter: `market_id=eq.${marketId}`,
       },
       (payload) => {
-        handlePayload(table, payload, onUpdate);
+        console.log(`${LOG} raw event`, {
+          table,
+          channel: channelName,
+          event: payload.eventType,
+          hasNew: payload.new != null,
+          hasOld: payload.old != null,
+        });
+        handlePayload(channelName, table, payload, onUpdate);
       }
     )
     .subscribe((status, err) => {
-      logChannelStatus(channelName, table, [marketId], status, err);
+      logSubscribeStatus(table, channelName, [marketId], status, err);
     });
 
   return () => {
-    console.log(`${LOG_PREFIX} unsubscribed`, { channel: channelName, table, marketIds: [marketId] });
+    console.log(`${LOG} unsubscribed`, { channel: channelName, table, marketIds: [marketId] });
     supabase.removeChannel(channel);
   };
 }
@@ -151,22 +140,27 @@ function subscribeTableMany<T extends { market_id: number }>(
         filter: `market_id=eq.${marketId}`,
       },
       (payload) => {
-        handlePayload(table, payload, onUpdate);
+        console.log(`${LOG} raw event`, {
+          table,
+          channel: channelName,
+          event: payload.eventType,
+          hasNew: payload.new != null,
+          hasOld: payload.old != null,
+        });
+        handlePayload(channelName, table, payload, onUpdate);
       }
     );
   }
 
   channel.subscribe((status, err) => {
-    logChannelStatus(channelName, table, marketIds, status, err);
+    logSubscribeStatus(table, channelName, marketIds, status, err);
   });
 
   return () => {
-    console.log(`${LOG_PREFIX} unsubscribed`, { channel: channelName, table, marketIds });
+    console.log(`${LOG} unsubscribed`, { channel: channelName, table, marketIds });
     supabase.removeChannel(channel);
   };
 }
-
-/** Subscribe to market_prices_latest for a single market. */
 export function subscribeMarketPrices(
   supabase: SupabaseClient,
   marketId: number,
