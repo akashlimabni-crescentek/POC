@@ -469,11 +469,12 @@ class KalshiLiveWorker {
     }
 
     const headers = buildWsAuthHeaders();
+    console.log(`[${WORKER_NAME}] connecting to API: ${KALSHI.wsUrl}`);
     this.ws = new WebSocket(KALSHI.wsUrl, { headers });
 
     this.ws.on('open', async () => {
       this.reconnectAttempts = 0;
-      console.log(`[${WORKER_NAME}] WebSocket connected`);
+      console.log(`[${WORKER_NAME}] WebSocket connected — API: ${KALSHI.wsUrl}`);
 
       try {
         await this.refreshHotSubscriptions({ initial: true });
@@ -487,13 +488,25 @@ class KalshiLiveWorker {
       this.handleMessage(data.toString());
     });
 
+    this.ws.on('unexpected-response', (_req, res) => {
+      let body = '';
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      res.on('end', () => {
+        console.error(
+          `[${WORKER_NAME}] WebSocket failed — API: ${KALSHI.wsUrl} status=${res.statusCode} ${body}`
+        );
+      });
+    });
+
     this.ws.on('close', (code) => {
-      console.warn(`[${WORKER_NAME}] WebSocket closed code=${code}`);
+      console.warn(`[${WORKER_NAME}] WebSocket closed — API: ${KALSHI.wsUrl} code=${code}`);
       this.scheduleReconnect();
     });
 
     this.ws.on('error', (err) => {
-      console.error(`[${WORKER_NAME}] WebSocket error: ${err.message}`);
+      console.error(`[${WORKER_NAME}] WebSocket error — API: ${KALSHI.wsUrl}: ${err.message}`);
     });
   }
 

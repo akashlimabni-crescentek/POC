@@ -12,6 +12,9 @@
     "dev:frontend": "npm run validate:env -- --frontend-only && npm run dev -w frontend",
     "validate:env": "node scripts/validate-env.js",
     "promote:demo": "node scripts/promote-demo-events.js --limit=15 --provider=kalshi",
+    "kalshi:ws-headers": "node scripts/kalshi-ws-headers.js",
+    "kalshi:ws-proxy": "node scripts/kalshi-ws-proxy.js",
+    "kalshi:ws-test": "node scripts/kalshi-ws-test.js",
     "test": "npm test -w backend"
   },
   "devDependencies": {

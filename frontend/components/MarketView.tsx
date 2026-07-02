@@ -6,6 +6,12 @@ import { createBrowserClient } from '@/lib/supabase/client';
 import { getCandles } from '@/lib/queries';
 import { getMarketDisplayName } from '@/lib/market-label';
 import { aggregateCandles } from '@/lib/candle-aggregate';
+import { applyLiveTickToCandles } from '@/lib/live-tick-candles';
+import {
+  subscribeLiveTicks,
+  subscribeMarketIngestionState,
+  subscribeMarketPrices,
+} from '@/lib/realtime';
 import {
   OHLCV_INTERVALS,
   OHLCV_SOURCE,
@@ -17,7 +23,6 @@ import { pickProvider, pickRelation } from '@/lib/utils';
 import OhlcvChart from '@/components/OhlcvChart';
 import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
 
-const POLL_MS = 2_000;
 const STALE_MS = 30_000;
 
 function pickPrice(latest: MarketRow['market_prices_latest']): MarketPriceLatest | null {
@@ -39,6 +44,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
   const [candles, setCandles] = useState<CandleRow[]>([]);
   const [candlesLoading, setCandlesLoading] = useState(true);
   const [price, setPrice] = useState<MarketPriceLatest | null>(pickPrice(market.market_prices_latest));
+  const [ingestionTier, setIngestionTier] = useState(market.ingestion_tier);
 
   const eventTitle = pickRelation(market.events)?.title ?? null;
   const displayName = getMarketDisplayName(market, eventTitle);
@@ -64,18 +70,10 @@ export default function MarketView({ market }: { market: MarketRow }) {
     }
   }, [market.id, ohlcvInterval]);
 
-  const loadPrice = useCallback(async () => {
-    const supabase = createBrowserClient();
-    const { data, error } = await supabase
-      .from('market_prices_latest')
-      .select('market_id, bid, ask, mid, last_price, updated_at')
-      .eq('market_id', market.id)
-      .maybeSingle();
-
-    if (!error && data) {
-      setPrice(data);
-    }
-  }, [market.id]);
+  useEffect(() => {
+    setPrice(pickPrice(market.market_prices_latest));
+    setIngestionTier(market.ingestion_tier);
+  }, [market.id, market.market_prices_latest, market.ingestion_tier]);
 
   useEffect(() => {
     loadCandles();
@@ -84,33 +82,22 @@ export default function MarketView({ market }: { market: MarketRow }) {
   useEffect(() => {
     const supabase = createBrowserClient();
 
-    loadPrice();
-
-    const channel = supabase
-      .channel(`market-price-${market.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'market_prices_latest',
-          filter: `market_id=eq.${market.id}`,
-        },
-        (payload) => {
-          if (payload.new && typeof payload.new === 'object') {
-            setPrice(payload.new as MarketPriceLatest);
-          }
-        }
-      )
-      .subscribe();
-
-    const pollId = window.setInterval(loadPrice, POLL_MS);
+    const unsubscribePrices = subscribeMarketPrices(supabase, market.id, setPrice);
+    const unsubscribeTicks = subscribeLiveTicks(supabase, market.id, (tick) => {
+      setCandles((prev) => applyLiveTickToCandles(prev, tick));
+    });
+    const unsubscribeIngestion = subscribeMarketIngestionState(supabase, market.id, (state) => {
+      if (state.tier) {
+        setIngestionTier(state.tier);
+      }
+    });
 
     return () => {
-      window.clearInterval(pollId);
-      supabase.removeChannel(channel);
+      unsubscribePrices();
+      unsubscribeTicks();
+      unsubscribeIngestion();
     };
-  }, [market.id, loadPrice]);
+  }, [market.id]);
 
   const stale = isStale(price?.updated_at);
   const providerName =
@@ -136,7 +123,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
             </div>
           </div>
           <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start' }}>
-            <span className={`badge badge-${market.ingestion_tier}`}>{market.ingestion_tier}</span>
+            <span className={`badge badge-${ingestionTier}`}>{ingestionTier}</span>
             <span className="badge">{market.status ?? 'unknown'}</span>
           </div>
         </div>

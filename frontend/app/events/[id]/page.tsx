@@ -1,12 +1,11 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { createServerClient } from '@/lib/supabase/server';
-import { getEventById, getEventMarkets, pickLatestPrice } from '@/lib/queries';
-import { getMarketDisplayName } from '@/lib/market-label';
+import { getEventById, getEventMarkets } from '@/lib/queries';
 import { pickProvider } from '@/lib/utils';
-import { formatProbability } from '@/lib/chart';
 import PromoteOnMount from '@/components/PromoteOnMount';
 import EventChart from '@/components/EventChart';
+import EventMarketsList from '@/components/EventMarketsList';
 
 type EventPageProps = {
   params: {
@@ -60,38 +59,7 @@ export default async function EventPage({ params }: EventPageProps) {
 
       <h2 style={{ fontSize: '1.125rem', margin: '1.5rem 0 0.75rem' }}>Markets</h2>
 
-      {markets.length === 0 ? (
-        <div className="card">
-          <p style={{ margin: 0 }}>No markets linked to this event yet.</p>
-        </div>
-      ) : (
-        <div className="market-list">
-          {markets.map((market) => {
-            const latest = pickLatestPrice(market);
-            const displayName = getMarketDisplayName(market, event.title);
-            return (
-              <Link key={market.id} href={`/markets/${market.id}`} className="card card-link">
-                <div className="market-row">
-                  <div>
-                    <div style={{ fontWeight: 600 }}>{displayName}</div>
-                    <div className="muted" style={{ fontSize: '0.875rem', marginTop: '0.25rem' }}>
-                      {market.external_id}
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                    <span className={`badge badge-${market.ingestion_tier}`}>
-                      {market.ingestion_tier}
-                    </span>
-                    <span style={{ fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
-                      {formatProbability(latest?.last_price ?? latest?.mid)}
-                    </span>
-                  </div>
-                </div>
-              </Link>
-            );
-          })}
-        </div>
-      )}
+      <EventMarketsList eventTitle={event.title} markets={markets} />
     </div>
   );
 }

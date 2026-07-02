@@ -59,3 +59,22 @@ export type CandleRow = {
 };
 
 export type CandleInterval = '1m' | '5m' | '1h' | '1d';
+
+export type LiveTickRow = {
+  id?: number;
+  market_id: number;
+  ts: string;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  last_price: number | null;
+  volume: number | null;
+};
+
+export type MarketIngestionStateRow = {
+  market_id: number;
+  tier: string | null;
+  last_backfill_at: string | null;
+  last_candle_ts: Record<string, string> | null;
+  last_poll_ts: string | null;
+};

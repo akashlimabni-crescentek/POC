@@ -5,6 +5,8 @@ import { createBrowserClient } from '@/lib/supabase/client';
 import { getCandles, pickLatestPrice } from '@/lib/queries';
 import { getMarketDisplayName } from '@/lib/market-label';
 import { aggregateCandles } from '@/lib/candle-aggregate';
+import { applyLiveTickToCandles } from '@/lib/live-tick-candles';
+import { subscribeLiveTicks, subscribeMarketPricesMany } from '@/lib/realtime';
 import {
   LINE_TIME_RANGES,
   OHLCV_INTERVALS,
@@ -20,9 +22,28 @@ import {
 import { toLinePoints, type LineSeriesInput } from '@/lib/chart';
 import MultiLineChart from '@/components/MultiLineChart';
 import OhlcvChart from '@/components/OhlcvChart';
-import type { CandleRow, MarketRow } from '@/lib/types';
+import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
 
 const DEFAULT_LINE_VISIBLE = 4;
+
+function applyPriceToLineSeries(
+  series: LineSeriesInput[],
+  row: MarketPriceLatest
+): LineSeriesInput[] {
+  const value = row.last_price ?? row.mid;
+  if (value == null) {
+    return series;
+  }
+
+  return series.map((item) => {
+    if (item.id !== row.market_id || !item.points.length) {
+      return item;
+    }
+    const points = [...item.points];
+    points[points.length - 1] = { ...points[points.length - 1], value };
+    return { ...item, points };
+  });
+}
 
 function sortMarketsByPrice(markets: MarketRow[]): MarketRow[] {
   return [...markets].sort((a, b) => {
@@ -154,6 +175,36 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
       loadOhlcvData();
     }
   }, [mode, loadOhlcvData, selectedMarketId]);
+
+  useEffect(() => {
+    if (mode !== 'line' || visibleIds.size === 0) {
+      return;
+    }
+
+    const supabase = createBrowserClient();
+    const ids = [...visibleIds];
+
+    return subscribeMarketPricesMany(
+      supabase,
+      `event-chart-prices-${ids.join('-')}`,
+      ids,
+      (row) => {
+        setLineSeries((prev) => applyPriceToLineSeries(prev, row));
+      }
+    );
+  }, [mode, visibleIds]);
+
+  useEffect(() => {
+    if (mode !== 'ohlcv' || selectedMarketId == null) {
+      return;
+    }
+
+    const supabase = createBrowserClient();
+
+    return subscribeLiveTicks(supabase, selectedMarketId, (tick) => {
+      setOhlcvCandles((prev) => applyLiveTickToCandles(prev, tick));
+    });
+  }, [mode, selectedMarketId]);
 
   if (!markets.length) {
     return null;
