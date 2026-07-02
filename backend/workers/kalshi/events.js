@@ -46,6 +46,12 @@ function parseSeriesTickersFromEnv() {
   return fromEnv ?? [];
 }
 
+function parseEventTickersFromEnv() {
+  return process.env.KALSHI_EVENT_TICKERS?.split(',')
+    .map((s) => s.trim())
+    .filter(Boolean) ?? [];
+}
+
 function getSeriesTickers() {
   return parseSeriesTickersFromEnv();
 }
@@ -80,6 +86,14 @@ function filterByConfiguredSeries(markets, seriesTickers) {
   }
   const allowed = new Set(seriesTickers);
   return markets.filter((m) => allowed.has(m.series_ticker));
+}
+
+function filterByConfiguredEventTickers(markets, eventTickers) {
+  if (!eventTickers.length) {
+    return markets;
+  }
+  const allowed = new Set(eventTickers);
+  return markets.filter((m) => allowed.has(m.event_ticker));
 }
 
 function mapMarketStatus(status) {
@@ -184,7 +198,19 @@ async function getProviderId() {
   return cachedProviderId;
 }
 
-async function fetchMarketsCold(seriesTickers) {
+async function fetchMarketsCold(seriesTickers, eventTickers) {
+  if (eventTickers.length > 0) {
+    const all = [];
+    for (const eventTicker of eventTickers) {
+      const batch = await fetchMarketsPaginated({
+        event_ticker: eventTicker,
+        status: 'open',
+      });
+      all.push(...batch);
+    }
+    return all;
+  }
+
   if (seriesTickers.length === 0) {
     return fetchMarketsPaginated({ status: 'open' });
   }
@@ -329,7 +355,9 @@ async function persistPollWatermark(providerId, marketRows, pollStartedAtSec) {
 
 async function poll() {
   const providerId = await getProviderId();
-  const seriesTickers = await resolveSeriesTickers();
+  const eventTickers = parseEventTickersFromEnv();
+  const seriesTickers =
+    eventTickers.length > 0 ? [] : await resolveSeriesTickers();
   const pollStartedAtSec = Math.floor(Date.now() / 1000);
   let rowsWritten = 0;
 
@@ -339,13 +367,14 @@ async function poll() {
   let markets;
 
   if (isFirstPoll) {
-    markets = await fetchMarketsCold(seriesTickers);
+    markets = await fetchMarketsCold(seriesTickers, eventTickers);
   } else {
     if (lastPollTs == null) {
       throw new Error(`[${WORKER_NAME}] warm poll requires lastPollTs`);
     }
     markets = await fetchUpdatedMarkets(lastPollTs);
     markets = filterByConfiguredSeries(markets, seriesTickers);
+    markets = filterByConfiguredEventTickers(markets, eventTickers);
   }
 
   const grouped = groupMarketsByEvent(markets);
@@ -405,7 +434,7 @@ async function poll() {
   isFirstPoll = false;
 
   console.log(
-    `[${WORKER_NAME}] cycle: mode=${pollMode} series=${seriesTickers.length || 'all'} events=${eventRows.length} markets=${marketRows.length} written=${rowsWritten} lastPollTs=${lastPollTs}`
+    `[${WORKER_NAME}] cycle: mode=${pollMode} series=${seriesTickers.length || 'all'} events_filter=${eventTickers.length ? eventTickers.join(',') : 'all'} events=${eventRows.length} markets=${marketRows.length} written=${rowsWritten} lastPollTs=${lastPollTs}`
   );
 
   return rowsWritten;
@@ -442,6 +471,8 @@ module.exports = {
   getSeriesTickers,
   resolveSeriesTickers,
   filterByConfiguredSeries,
+  filterByConfiguredEventTickers,
+  parseEventTickersFromEnv,
   mapMarketStatus,
   mapEventStatus,
   mapEventRow,

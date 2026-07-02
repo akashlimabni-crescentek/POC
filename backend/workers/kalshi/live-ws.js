@@ -331,6 +331,16 @@ class KalshiLiveWorker {
 
     const { bid, ask, last } = extractKalshiPrices(payload);
     const ts = normalizeEpochMs(payload.ts);
+
+    console.log(`[${WORKER_NAME}] socket received (ticker)`, {
+      market_ticker: ticker,
+      market_id: state.marketId,
+      bid,
+      ask,
+      last,
+      ts: new Date(ts).toISOString(),
+    });
+
     updateSnapshot(state, { bid, ask, last, ts });
   }
 
@@ -345,6 +355,14 @@ class KalshiLiveWorker {
     const ts = normalizeEpochMs(payload.ts);
 
     if (price == null) return;
+
+    console.log(`[${WORKER_NAME}] socket received (trade)`, {
+      market_ticker: ticker,
+      market_id: state.marketId,
+      last_price: price,
+      size,
+      ts: new Date(ts).toISOString(),
+    });
 
     state.lastRealTickAt = ts;
     state.lastKnownClose = price;
@@ -420,8 +438,6 @@ class KalshiLiveWorker {
 
     if (tickRows.length === 0) return 0;
 
-    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
-
     const latestRows = [...latestByMarket.values()].map((snap) => ({
       market_id: snap.market_id,
       bid: snap.bid,
@@ -430,6 +446,13 @@ class KalshiLiveWorker {
       last_price: snap.last_price,
       updated_at: snap.ts,
     }));
+
+    console.log(`[${WORKER_NAME}] pushing to Supabase (triggers Realtime)`, {
+      live_ticks: tickRows,
+      market_prices_latest: latestRows,
+    });
+
+    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
 
     if (latestRows.length > 0) {
       const { error } = await supabase.from('market_prices_latest').upsert(latestRows, {
@@ -446,6 +469,11 @@ class KalshiLiveWorker {
   async flushCandles() {
     const candleRows = collectCompletedCandles(this.tickerStates);
     if (candleRows.length === 0) return 0;
+
+    console.log(`[${WORKER_NAME}] pushing to Supabase (candles)`, {
+      count: candleRows.length,
+      candles: candleRows,
+    });
 
     const { written } = await upsertBatched(supabase, 'candles', candleRows, {
       onConflict: 'market_id,interval,ts',

@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
   filterByConfiguredSeries,
+  filterByConfiguredEventTickers,
   mapMarketStatus,
   mapEventStatus,
   mapEventRow,
@@ -20,6 +21,15 @@ describe('kalshi/events', () => {
     ];
     expect(filterByConfiguredSeries(markets, ['SERIES-A'])).toHaveLength(1);
     expect(filterByConfiguredSeries(markets, [])).toHaveLength(2);
+  });
+
+  it('filterByConfiguredEventTickers post-filters by event_ticker', () => {
+    const markets = [
+      { ticker: 'A', event_ticker: 'EVT-1' },
+      { ticker: 'B', event_ticker: 'EVT-2' },
+    ];
+    expect(filterByConfiguredEventTickers(markets, ['EVT-1'])).toHaveLength(1);
+    expect(filterByConfiguredEventTickers(markets, [])).toHaveLength(2);
   });
 
   it('mapMarketStatus maps Kalshi open to open', () => {
