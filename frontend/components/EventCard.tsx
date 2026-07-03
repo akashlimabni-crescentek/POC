@@ -1,11 +1,9 @@
 import Link from 'next/link';
+import { formatGmtIso } from '@/lib/datetime';
 import type { EventRow } from '@/lib/types';
 
 function formatDate(value: string | null) {
-  if (!value) {
-    return '—';
-  }
-  return new Date(value).toLocaleString();
+  return formatGmtIso(value);
 }
 
 export default function EventCard({ event }: { event: EventRow }) {

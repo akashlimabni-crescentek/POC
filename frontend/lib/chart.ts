@@ -8,9 +8,15 @@ import {
   type HistogramData,
   type LineData,
   type MouseEventParams,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import type { CandleRow } from './types';
+import {
+  formatGmtFromSeconds,
+  formatLightweightChartAxis,
+  formatLightweightChartTime,
+} from './datetime';
 
 export type ChartCandle = CandlestickData<UTCTimestamp>;
 export type ChartLinePoint = LineData<UTCTimestamp>;
@@ -29,13 +35,7 @@ const CHART_GRID = {
 const PRICE_FORMATTER = (price: number) => `${(price * 100).toFixed(1)}%`;
 
 function formatChartTime(time: number): string {
-  return new Date(time * 1000).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return formatGmtFromSeconds(time);
 }
 
 function formatChartPriceDetailed(value: number): string {
@@ -119,11 +119,15 @@ function baseChartOptions(width: number, height: number) {
     layout: CHART_LAYOUT,
     grid: CHART_GRID,
     rightPriceScale: { borderColor: '#30363d' },
-    localization: { priceFormatter: PRICE_FORMATTER },
+    localization: {
+      priceFormatter: PRICE_FORMATTER,
+      timeFormatter: formatLightweightChartTime,
+    },
     timeScale: {
       borderColor: '#30363d',
       timeVisible: true,
       secondsVisible: false,
+      tickMarkFormatter: (time: Time) => formatLightweightChartAxis(time),
     },
     crosshair: {
       mode: CrosshairMode.Magnet,
@@ -201,8 +205,48 @@ export type LineSeriesInput = {
   points: ChartLinePoint[];
 };
 
+export type ChartSetOptions = {
+  /** Fit all data in view — use on initial load or when range/market changes. */
+  fit?: boolean;
+};
+
+function restoreVisibleRange(
+  chart: IChartApi,
+  visibleRange: ReturnType<ReturnType<IChartApi['timeScale']>['getVisibleLogicalRange']>
+) {
+  if (visibleRange) {
+    chart.timeScale().setVisibleLogicalRange(visibleRange);
+  }
+}
+
+function isAppendPoint(prev: ChartLinePoint[], next: ChartLinePoint[]): boolean {
+  if (next.length !== prev.length + 1) {
+    return false;
+  }
+  for (let i = 0; i < prev.length; i += 1) {
+    if (prev[i].time !== next[i].time || prev[i].value !== next[i].value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isLastPointUpdate(prev: ChartLinePoint[], next: ChartLinePoint[]): boolean {
+  if (!prev.length || next.length !== prev.length) {
+    return false;
+  }
+  for (let i = 0; i < prev.length - 1; i += 1) {
+    if (prev[i].time !== next[i].time || prev[i].value !== next[i].value) {
+      return false;
+    }
+  }
+  const p = prev[prev.length - 1];
+  const n = next[next.length - 1];
+  return p.time === n.time;
+}
+
 export type MultiLineChartHandle = {
-  setLines: (lines: LineSeriesInput[]) => void;
+  setLines: (lines: LineSeriesInput[], options?: ChartSetOptions) => void;
   resize: (width: number, height: number) => void;
   destroy: () => void;
 };
@@ -213,15 +257,20 @@ export function createMultiLineChart(
 ): MultiLineChartHandle {
   const chart = createChart(container, baseChartOptions(container.clientWidth, height));
   const seriesById = new Map<number, ISeriesApi<'Line'>>();
+  const pointsById = new Map<number, ChartLinePoint[]>();
 
   return {
-    setLines(lines) {
+    setLines(lines, options = {}) {
+      const fit = options.fit === true;
+      const visibleRange = fit ? null : chart.timeScale().getVisibleLogicalRange();
+
       const nextIds = new Set(lines.map((line) => line.id));
 
       for (const [id, series] of seriesById) {
         if (!nextIds.has(id)) {
           chart.removeSeries(series);
           seriesById.delete(id);
+          pointsById.delete(id);
         }
       }
 
@@ -236,13 +285,34 @@ export function createMultiLineChart(
             lastValueVisible: true,
           });
           seriesById.set(line.id, series);
-        } else {
-          series.applyOptions({ color: line.color, title: line.label });
+          series.setData(line.points);
+          pointsById.set(line.id, line.points);
+          continue;
         }
-        series.setData(line.points);
+
+        series.applyOptions({ color: line.color, title: line.label });
+
+        const prev = pointsById.get(line.id) ?? [];
+        const last = line.points[line.points.length - 1];
+        if (!last) {
+          series.setData([]);
+          pointsById.set(line.id, []);
+          continue;
+        }
+
+        if (isLastPointUpdate(prev, line.points) || isAppendPoint(prev, line.points)) {
+          series.update(last);
+        } else {
+          series.setData(line.points);
+        }
+        pointsById.set(line.id, line.points);
       }
 
-      chart.timeScale().fitContent();
+      if (fit) {
+        chart.timeScale().fitContent();
+      } else {
+        restoreVisibleRange(chart, visibleRange);
+      }
     },
     resize(width, nextHeight) {
       chart.applyOptions({ width, height: nextHeight });
@@ -254,10 +324,38 @@ export function createMultiLineChart(
 }
 
 export type OhlcvChartHandle = {
-  setCandles: (rows: CandleRow[]) => void;
+  setCandles: (rows: CandleRow[], options?: ChartSetOptions) => void;
   resize: (width: number, height: number) => void;
   destroy: () => void;
 };
+
+function isLastCandleUpdate(prev: ChartCandle[], next: ChartCandle[]): boolean {
+  if (!prev.length || next.length !== prev.length) {
+    return false;
+  }
+  for (let i = 0; i < prev.length - 1; i += 1) {
+    const p = prev[i];
+    const n = next[i];
+    if (p.time !== n.time || p.open !== n.open || p.high !== n.high || p.low !== n.low || p.close !== n.close) {
+      return false;
+    }
+  }
+  return prev[prev.length - 1].time === next[next.length - 1].time;
+}
+
+function isAppendCandle(prev: ChartCandle[], next: ChartCandle[]): boolean {
+  if (next.length !== prev.length + 1) {
+    return false;
+  }
+  for (let i = 0; i < prev.length; i += 1) {
+    const p = prev[i];
+    const n = next[i];
+    if (p.time !== n.time || p.open !== n.open || p.high !== n.high || p.low !== n.low || p.close !== n.close) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export function createOhlcvChart(
   container: HTMLElement,
@@ -271,6 +369,7 @@ export function createOhlcvChart(
   }
   const tooltip = createOhlcvTooltip(tooltipHost);
   let candleByTime = new Map<number, CandleRow>();
+  let lastChartCandles: ChartCandle[] = [];
 
   const candleSeries = chart.addCandlestickSeries({
     upColor: '#3fb950',
@@ -322,7 +421,10 @@ export function createOhlcvChart(
   chart.subscribeCrosshairMove(crosshairHandler);
 
   return {
-    setCandles(rows) {
+    setCandles(rows, options = {}) {
+      const fit = options.fit === true;
+      const visibleRange = fit ? null : chart.timeScale().getVisibleLogicalRange();
+
       candleByTime = new Map();
       for (const row of rows) {
         const t = Math.floor(Date.parse(row.ts) / 1000);
@@ -330,9 +432,31 @@ export function createOhlcvChart(
           candleByTime.set(t, row);
         }
       }
-      candleSeries.setData(toChartCandles(rows));
-      volumeSeries.setData(toVolumeBars(rows));
-      chart.timeScale().fitContent();
+
+      const chartCandles = toChartCandles(rows);
+      const volumeBars = toVolumeBars(rows);
+      const lastCandle = chartCandles[chartCandles.length - 1];
+      const lastVolume = volumeBars[volumeBars.length - 1];
+
+      if (
+        lastCandle &&
+        lastVolume &&
+        (isLastCandleUpdate(lastChartCandles, chartCandles) || isAppendCandle(lastChartCandles, chartCandles))
+      ) {
+        candleSeries.update(lastCandle);
+        volumeSeries.update(lastVolume);
+      } else {
+        candleSeries.setData(chartCandles);
+        volumeSeries.setData(volumeBars);
+      }
+
+      lastChartCandles = chartCandles;
+
+      if (fit) {
+        chart.timeScale().fitContent();
+      } else {
+        restoreVisibleRange(chart, visibleRange);
+      }
     },
     resize(width, nextHeight) {
       chart.applyOptions({ width, height: nextHeight });

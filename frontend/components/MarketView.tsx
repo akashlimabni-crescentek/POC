@@ -15,10 +15,12 @@ import {
 import {
   OHLCV_INTERVALS,
   OHLCV_SOURCE,
+  ohlcvBucketMs,
   ohlcvRangeToWindow,
   type OhlcvInterval,
 } from '@/lib/chart-config';
 import { formatProbability } from '@/lib/chart';
+import { formatGmtIso } from '@/lib/datetime';
 import { pickProvider, pickRelation } from '@/lib/utils';
 import OhlcvChart from '@/components/OhlcvChart';
 import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
@@ -42,6 +44,7 @@ function isStale(updatedAt: string | null | undefined): boolean {
 export default function MarketView({ market }: { market: MarketRow }) {
   const [ohlcvInterval, setOhlcvInterval] = useState<OhlcvInterval>('5m');
   const [candles, setCandles] = useState<CandleRow[]>([]);
+  const [candlesResetKey, setCandlesResetKey] = useState('');
   const [candlesLoading, setCandlesLoading] = useState(true);
   const [price, setPrice] = useState<MarketPriceLatest | null>(pickPrice(market.market_prices_latest));
   const [ingestionTier, setIngestionTier] = useState(market.ingestion_tier);
@@ -62,6 +65,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
       }
 
       setCandles(rows);
+      setCandlesResetKey(`${market.id}-${ohlcvInterval}`);
     } catch (err) {
       console.error('[MarketView] getCandles failed:', err);
       setCandles([]);
@@ -84,7 +88,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
 
     const unsubscribePrices = subscribeMarketPrices(supabase, market.id, setPrice);
     const unsubscribeTicks = subscribeLiveTicks(supabase, market.id, (tick) => {
-      setCandles((prev) => applyLiveTickToCandles(prev, tick));
+      setCandles((prev) => applyLiveTickToCandles(prev, tick, ohlcvBucketMs(ohlcvInterval)));
     });
     const unsubscribeIngestion = subscribeMarketIngestionState(supabase, market.id, (state) => {
       if (state.tier) {
@@ -97,7 +101,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
       unsubscribeTicks();
       unsubscribeIngestion();
     };
-  }, [market.id]);
+  }, [market.id, ohlcvInterval]);
 
   const stale = isStale(price?.updated_at);
   const providerName =
@@ -150,7 +154,7 @@ export default function MarketView({ market }: { market: MarketRow }) {
         {stale && (
           <div className="status-banner status-banner-warn">
             Price may be stale
-            {price?.updated_at ? ` — last updated ${new Date(price.updated_at).toLocaleString()}` : ''}
+            {price?.updated_at ? ` — last updated ${formatGmtIso(price.updated_at)}` : ''}
           </div>
         )}
       </div>
@@ -182,7 +186,9 @@ export default function MarketView({ market }: { market: MarketRow }) {
           </div>
         )}
 
-        {!candlesLoading && candles.length > 0 && <OhlcvChart candles={candles} />}
+        {!candlesLoading && candles.length > 0 && (
+          <OhlcvChart candles={candles} resetKey={candlesResetKey} />
+        )}
       </div>
     </div>
   );

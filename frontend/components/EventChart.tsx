@@ -13,13 +13,14 @@ import {
   OHLCV_SOURCE,
   lineRangeToWindow,
   lineSourceInterval,
+  ohlcvBucketMs,
   ohlcvRangeToWindow,
   outcomeColor,
   type ChartMode,
   type LineTimeRange,
   type OhlcvInterval,
 } from '@/lib/chart-config';
-import { toLinePoints, type LineSeriesInput } from '@/lib/chart';
+import { toLinePoints, type ChartLinePoint, type LineSeriesInput } from '@/lib/chart';
 import MultiLineChart from '@/components/MultiLineChart';
 import OhlcvChart from '@/components/OhlcvChart';
 import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
@@ -31,7 +32,12 @@ function applyPriceToLineSeries(
   row: MarketPriceLatest
 ): LineSeriesInput[] {
   const value = row.last_price ?? row.mid;
-  if (value == null) {
+  if (value == null || !row.updated_at) {
+    return series;
+  }
+
+  const timeSec = Math.floor(Date.parse(row.updated_at) / 1000);
+  if (Number.isNaN(timeSec)) {
     return series;
   }
 
@@ -39,8 +45,18 @@ function applyPriceToLineSeries(
     if (item.id !== row.market_id || !item.points.length) {
       return item;
     }
+
     const points = [...item.points];
-    points[points.length - 1] = { ...points[points.length - 1], value };
+    const last = points[points.length - 1];
+
+    if (timeSec > last.time) {
+      points.push({ time: timeSec as ChartLinePoint['time'], value });
+    } else if (timeSec === last.time) {
+      points[points.length - 1] = { time: last.time, value };
+    } else {
+      points[points.length - 1] = { ...last, value };
+    }
+
     return { ...item, points };
   });
 }
@@ -67,6 +83,8 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
   const [selectedMarketId, setSelectedMarketId] = useState<number | null>(null);
   const [lineSeries, setLineSeries] = useState<LineSeriesInput[]>([]);
   const [ohlcvCandles, setOhlcvCandles] = useState<CandleRow[]>([]);
+  const [lineResetKey, setLineResetKey] = useState('');
+  const [ohlcvResetKey, setOhlcvResetKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -129,6 +147,7 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
       );
 
       setLineSeries(results.filter((r): r is LineSeriesInput => r != null && r.points.length > 0));
+      setLineResetKey(`${lineRange}-${[...visibleIds].sort((a, b) => a - b).join(',')}`);
     } catch (err) {
       console.error('[EventChart] line load failed:', err);
       setError('Failed to load chart data');
@@ -155,6 +174,7 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
       }
 
       setOhlcvCandles(rows);
+      setOhlcvResetKey(`${selectedMarketId}-${ohlcvInterval}`);
     } catch (err) {
       console.error('[EventChart] ohlcv load failed:', err);
       setError('Failed to load chart data');
@@ -202,9 +222,10 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
     const supabase = createBrowserClient();
 
     return subscribeLiveTicks(supabase, selectedMarketId, (tick) => {
-      setOhlcvCandles((prev) => applyLiveTickToCandles(prev, tick));
+      const bucketMs = ohlcvBucketMs(ohlcvInterval);
+      setOhlcvCandles((prev) => applyLiveTickToCandles(prev, tick, bucketMs));
     });
-  }, [mode, selectedMarketId]);
+  }, [mode, selectedMarketId, ohlcvInterval]);
 
   if (!markets.length) {
     return null;
@@ -320,10 +341,12 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
         </div>
       )}
 
-      {!loading && mode === 'line' && lineSeries.length > 0 && <MultiLineChart lines={lineSeries} />}
+      {!loading && mode === 'line' && lineSeries.length > 0 && (
+        <MultiLineChart lines={lineSeries} resetKey={lineResetKey} />
+      )}
 
       {!loading && mode === 'ohlcv' && ohlcvCandles.length > 0 && (
-        <OhlcvChart candles={ohlcvCandles} />
+        <OhlcvChart candles={ohlcvCandles} resetKey={ohlcvResetKey} />
       )}
     </div>
   );

@@ -85,6 +85,22 @@ export function ohlcvRangeToWindow(interval: OhlcvInterval): { from: string; to:
   };
 }
 
+const CANDLE_INTERVAL_MS: Record<CandleInterval, number> = {
+  '1m': 60 * 1000,
+  '5m': 5 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+};
+
+/** Bucket width for live tick → OHLCV candle updates in the chart UI. */
+export function ohlcvBucketMs(interval: OhlcvInterval): number {
+  const cfg = OHLCV_SOURCE[interval];
+  if (cfg.aggregateMs) {
+    return cfg.aggregateMs;
+  }
+  return CANDLE_INTERVAL_MS[cfg.sourceInterval];
+}
+
 export function outcomeColor(index: number): string {
   return OUTCOME_COLORS[index % OUTCOME_COLORS.length];
 }
