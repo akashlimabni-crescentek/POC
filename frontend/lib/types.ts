@@ -58,7 +58,7 @@ export type CandleRow = {
   trade_count: number | null;
 };
 
-export type CandleInterval = '1m' | '5m' | '1h' | '1d';
+export type CandleInterval = '1m' | '5m' | '15m' | '1h' | '4h' | '1d' | '1w';
 
 export type LiveTickRow = {
   id?: number;

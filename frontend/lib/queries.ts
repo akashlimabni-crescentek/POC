@@ -15,8 +15,11 @@ const DEFAULT_PAGE_SIZE = 50;
 const CANDLE_LOOKBACK_MS: Record<CandleInterval, number> = {
   '1m': 7 * 24 * 60 * 60 * 1000,
   '5m': 30 * 24 * 60 * 60 * 1000,
+  '15m': 30 * 24 * 60 * 60 * 1000,
   '1h': 90 * 24 * 60 * 60 * 1000,
+  '4h': 90 * 24 * 60 * 60 * 1000,
   '1d': 365 * 24 * 60 * 60 * 1000,
+  '1w': 365 * 24 * 60 * 60 * 1000,
 };
 
 export async function getProviders(supabase: SupabaseClient): Promise<Provider[]> {
@@ -147,6 +150,14 @@ export async function getCandles(
     from ?? new Date(now - CANDLE_LOOKBACK_MS[interval]).toISOString();
   const toIso = to ?? new Date(now).toISOString();
 
+  console.log('[candle] DB query', {
+    kind: 'history',
+    market_id: marketId,
+    interval,
+    from: fromIso,
+    to: toIso,
+  });
+
   const { data, error } = await supabase
     .from('candles')
     .select('market_id, interval, ts, open, high, low, close, volume, trade_count')
@@ -160,7 +171,73 @@ export async function getCandles(
     throw new Error(`getCandles failed: ${error.message}`);
   }
 
-  return data ?? [];
+  const rows = data ?? [];
+  console.log('[candle] DB result', {
+    kind: 'history',
+    market_id: marketId,
+    interval,
+    rowCount: rows.length,
+    firstTs: rows[0]?.ts ?? null,
+    lastTs: rows[rows.length - 1]?.ts ?? null,
+  });
+
+  return rows;
+}
+
+/**
+ * Fetch the finer stored candles that fall inside the current forming bucket,
+ * for every interval in `ladder`, in one round-trip. Used to reconstruct the
+ * right-edge candle without waiting for its own coarse row to be written.
+ * Returns rows grouped by interval so the composer can step down the ladder.
+ */
+export async function getFinerCandlesForBucket(
+  supabase: SupabaseClient,
+  marketId: number,
+  ladder: CandleInterval[],
+  bucketStartIso: string,
+  toIso: string
+): Promise<Record<string, CandleRow[]>> {
+  const byInterval: Record<string, CandleRow[]> = {};
+  for (const iv of ladder) {
+    byInterval[iv] = [];
+  }
+
+  if (ladder.length === 0) {
+    return byInterval;
+  }
+
+  console.log('[candle] DB query', {
+    kind: 'forming-bucket',
+    market_id: marketId,
+    intervals: ladder,
+    from: bucketStartIso,
+    to: toIso,
+  });
+
+  const { data, error } = await supabase
+    .from('candles')
+    .select('market_id, interval, ts, open, high, low, close, volume, trade_count')
+    .eq('market_id', marketId)
+    .in('interval', ladder)
+    .gte('ts', bucketStartIso)
+    .lte('ts', toIso)
+    .order('ts', { ascending: true });
+
+  if (error) {
+    throw new Error(`getFinerCandlesForBucket failed: ${error.message}`);
+  }
+
+  for (const row of data ?? []) {
+    (byInterval[row.interval] ??= []).push(row);
+  }
+
+  console.log('[candle] DB result', {
+    kind: 'forming-bucket',
+    market_id: marketId,
+    rowCounts: Object.fromEntries(ladder.map((iv) => [iv, byInterval[iv]?.length ?? 0])),
+  });
+
+  return byInterval;
 }
 
 /**

@@ -8,8 +8,11 @@ const LIVE_TICKS_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const CANDLE_RETENTION_MS = {
   '1m': 30 * 24 * 60 * 60 * 1000,
   '5m': 90 * 24 * 60 * 60 * 1000,
+  '15m': 90 * 24 * 60 * 60 * 1000,
   '1h': 2 * 365 * 24 * 60 * 60 * 1000,
+  '4h': 2 * 365 * 24 * 60 * 60 * 1000,
   '1d': 2 * 365 * 24 * 60 * 60 * 1000,
+  '1w': 2 * 365 * 24 * 60 * 60 * 1000,
 };
 
 /** Grace after market close before deleting all candles for that market */
@@ -125,8 +128,11 @@ async function runRetentionCycle(supabase, demoteStale) {
     live_ticks: await purgeLiveTicks(supabase, cutoffs.liveTicks),
     candles_1m: await purgeCandlesByInterval(supabase, '1m', cutoffs.candles['1m']),
     candles_5m: await purgeCandlesByInterval(supabase, '5m', cutoffs.candles['5m']),
+    candles_15m: await purgeCandlesByInterval(supabase, '15m', cutoffs.candles['15m']),
     candles_1h: await purgeCandlesByInterval(supabase, '1h', cutoffs.candles['1h']),
+    candles_4h: await purgeCandlesByInterval(supabase, '4h', cutoffs.candles['4h']),
     candles_1d: await purgeCandlesByInterval(supabase, '1d', cutoffs.candles['1d']),
+    candles_1w: await purgeCandlesByInterval(supabase, '1w', cutoffs.candles['1w']),
     closed_markets: await purgeClosedMarketCandles(supabase, cutoffs.closedMarketGrace),
   };
 

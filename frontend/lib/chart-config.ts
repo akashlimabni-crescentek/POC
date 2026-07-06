@@ -42,13 +42,15 @@ type OhlcvSource = {
   lookbackMs: number;
 };
 
+// 15m / 4h / 1w are now persisted directly (backend history rollup), so every
+// selectable interval reads its own stored rows — no client-side aggregateMs.
 export const OHLCV_SOURCE: Record<OhlcvInterval, OhlcvSource> = {
   '5m': { sourceInterval: '5m', lookbackMs: 30 * 24 * 60 * 60 * 1000 },
-  '15m': { sourceInterval: '5m', aggregateMs: 15 * 60 * 1000, lookbackMs: 30 * 24 * 60 * 60 * 1000 },
+  '15m': { sourceInterval: '15m', lookbackMs: 30 * 24 * 60 * 60 * 1000 },
   '1H': { sourceInterval: '1h', lookbackMs: 90 * 24 * 60 * 60 * 1000 },
-  '4H': { sourceInterval: '1h', aggregateMs: 4 * 60 * 60 * 1000, lookbackMs: 90 * 24 * 60 * 60 * 1000 },
+  '4H': { sourceInterval: '4h', lookbackMs: 90 * 24 * 60 * 60 * 1000 },
   '1D': { sourceInterval: '1d', lookbackMs: 365 * 24 * 60 * 60 * 1000 },
-  '1W': { sourceInterval: '1d', aggregateMs: 7 * 24 * 60 * 60 * 1000, lookbackMs: 365 * 24 * 60 * 60 * 1000 },
+  '1W': { sourceInterval: '1w', lookbackMs: 365 * 24 * 60 * 60 * 1000 },
 };
 
 /** Pick stored candle interval for a line-chart time range. */
@@ -88,9 +90,17 @@ export function ohlcvRangeToWindow(interval: OhlcvInterval): { from: string; to:
 const CANDLE_INTERVAL_MS: Record<CandleInterval, number> = {
   '1m': 60 * 1000,
   '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
   '1h': 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
   '1d': 24 * 60 * 60 * 1000,
+  '1w': 7 * 24 * 60 * 60 * 1000,
 };
+
+/** Milliseconds for a stored candle interval (1m / 5m / 1h / 1d). */
+export function candleIntervalMs(interval: CandleInterval): number {
+  return CANDLE_INTERVAL_MS[interval];
+}
 
 /** Bucket width for live tick → OHLCV candle updates in the chart UI. */
 export function ohlcvBucketMs(interval: OhlcvInterval): number {
@@ -100,6 +110,35 @@ export function ohlcvBucketMs(interval: OhlcvInterval): number {
   }
   return CANDLE_INTERVAL_MS[cfg.sourceInterval];
 }
+
+/**
+ * The forming (right-edge) candle for a selected interval is not read whole
+ * from the DB — the DB only writes a coarse candle once its bucket closes, so
+ * the current bucket would sit frozen for up to a full interval. Instead we
+ * reconstruct it *now* by stepping down through the finer, already-stored
+ * candles that fall inside the current bucket, then finishing with the live
+ * tick tail.
+ *
+ * `SUB_INTERVAL_LADDER[selected]` lists those finer stored intervals ordered
+ * **coarsest → finest**. The composer consumes as many whole coarse blocks as
+ * fit before `now`, then drops to the next finer rung for the remainder, and
+ * finally the live aggregator covers the ragged sub-minute tail. Every rung
+ * here must be an integer divisor of the selected interval and of the rung
+ * above it, so blocks tile the bucket exactly.
+ *
+ * All of 1m/5m/15m/1h/4h/1d are persisted, so each selected interval steps
+ * down through every finer stored interval — the coarsest blocks fill most of
+ * the bucket in a single row each, leaving the live aggregator only the last
+ * sub-minute sliver.
+ */
+export const SUB_INTERVAL_LADDER: Record<OhlcvInterval, CandleInterval[]> = {
+  '5m': ['1m'],
+  '15m': ['5m', '1m'],
+  '1H': ['15m', '5m', '1m'],
+  '4H': ['1h', '15m', '5m', '1m'],
+  '1D': ['4h', '1h', '15m', '5m', '1m'],
+  '1W': ['1d', '4h', '1h', '15m', '5m', '1m'],
+};
 
 export function outcomeColor(index: number): string {
   return OUTCOME_COLORS[index % OUTCOME_COLORS.length];

@@ -2,17 +2,24 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createBrowserClient } from '@/lib/supabase/client';
-import { getCandles } from '@/lib/queries';
+import { getCandles, getFinerCandlesForBucket } from '@/lib/queries';
 import { aggregateCandles } from '@/lib/candle-aggregate';
 import { createOhlcvChart, type OhlcvChartHandle } from '@/lib/chart';
-import { CandleAggregator, marketPriceToEvent } from '@/lib/candle-aggregator';
+import { CandleAggregator, bucketStartMs, marketPriceToEvent } from '@/lib/candle-aggregator';
+import { buildFormingCandle } from '@/lib/candle-composer';
 import { subscribeMarketPricesWithStatus } from '@/lib/realtime';
 import {
   OHLCV_SOURCE,
+  SUB_INTERVAL_LADDER,
   ohlcvBucketMs,
   ohlcvRangeToWindow,
   type OhlcvInterval,
 } from '@/lib/chart-config';
+import type { CandleInterval, CandleRow } from '@/lib/types';
+
+/** How often to refetch the finer sub-candles so newly-closed blocks fold into
+ *  the forming candle and the live tail shrinks. */
+const FINER_REFETCH_MS = 15_000;
 
 type Status = 'loading' | 'ready' | 'empty' | 'error';
 
@@ -51,6 +58,20 @@ export default function RealtimeOhlcvChart({
   const resyncingRef = useRef(false); // guards concurrent resyncs
   const reconnectRef = useRef(false); // saw a dropped/errored connection?
 
+  // ---- forming-candle refs ----
+  // Finer stored candles (5m/1m/…) covering the current bucket, grouped by
+  // interval. The forming right-edge candle is composed from these + the live
+  // tail, so it stays accurate before its own coarse row is ever written.
+  const finerRowsRef = useRef<Record<string, CandleRow[]>>({});
+  const formingBucketStartRef = useRef<number | null>(null);
+  // Snapshot of the active key so the []-deps paint callback reads live config.
+  const configRef = useRef<{
+    marketId: number;
+    interval: OhlcvInterval;
+    bucketMs: number;
+    ladder: CandleInterval[];
+  } | null>(null);
+
   // ---- slow-lane state (coarse, low frequency) ----
   const [status, setStatus] = useState<Status>('loading');
 
@@ -81,22 +102,56 @@ export default function RealtimeOhlcvChart({
     };
   }, [height]);
 
-  // Coalesce live-candle paints to at most one per animation frame. Every event
-  // is folded into the aggregator immediately (so high/low/volume stay exact);
-  // only the draw is throttled, which keeps a hot market off the main thread.
+  // Compose the forming right-edge candle (finer DB blocks + live tail) and
+  // paint it. `log` is true for coarse events (load, bucket roll, refetch) and
+  // false on the hot per-frame path to keep the console readable.
+  const paintForming = useCallback((log: boolean) => {
+    const handle = handleRef.current;
+    const cfg = configRef.current;
+    if (!handle || !historyReadyRef.current || !cfg) {
+      return;
+    }
+    const now = Date.now();
+    const bucket = bucketStartMs(now, cfg.bucketMs);
+    const { candle } = buildFormingCandle({
+      marketId: cfg.marketId,
+      interval: cfg.interval,
+      bucketStartMs: bucket,
+      nowMs: now,
+      ladder: cfg.ladder,
+      finerRowsByInterval: finerRowsRef.current,
+      liveTail: aggregatorRef.current?.current ?? null,
+      log,
+    });
+    if (!candle) {
+      return;
+    }
+    handle.updateLive(candle);
+    if (log) {
+      console.log('[candle] chart update', {
+        interval: cfg.interval,
+        ts: candle.ts,
+        o: candle.open,
+        h: candle.high,
+        l: candle.low,
+        c: candle.close,
+        v: candle.volume,
+      });
+    }
+  }, []);
+
+  // Coalesce paints to at most one per animation frame. Every event is folded
+  // into the aggregator immediately (so high/low/close stay exact); only the
+  // draw is throttled, which keeps a hot market off the main thread.
   const scheduleFlush = useCallback(() => {
     if (rafRef.current != null) {
       return;
     }
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = null;
-      const handle = handleRef.current;
-      const live = aggregatorRef.current?.current;
-      if (handle && historyReadyRef.current && live) {
-        handle.updateLive(live);
-      }
+      paintForming(false);
     });
-  }, []);
+  }, [paintForming]);
 
   // Load history + subscribe. Re-runs whenever the (market, interval) key
   // changes — this single path covers both market switching and interval
@@ -114,21 +169,79 @@ export default function RealtimeOhlcvChart({
     setStatus('loading');
 
     const supabase = createBrowserClient();
-    aggregatorRef.current = new CandleAggregator(marketId, interval, ohlcvBucketMs(interval));
+    const bucketMs = ohlcvBucketMs(interval);
+    const ladder = SUB_INTERVAL_LADDER[interval];
+    aggregatorRef.current = new CandleAggregator(marketId, interval, bucketMs);
+    configRef.current = { marketId, interval, bucketMs, ladder };
+    finerRowsRef.current = {};
+    formingBucketStartRef.current = null;
 
     // Fetch immutable history for the active key and hand it to the chart once.
+    // Any row at/after the current bucket start is dropped — that bucket is the
+    // forming candle, which we own via composition, so history stays strictly
+    // in the past and never collides with the live right edge.
     const loadHistory = async (fit: boolean) => {
       const config = OHLCV_SOURCE[interval];
       const { from, to } = ohlcvRangeToWindow(interval);
       let rows = await getCandles(supabase, marketId, config.sourceInterval, from, to);
       if (config.aggregateMs) {
+        console.log('[candle] before aggregate', {
+          interval,
+          sourceInterval: config.sourceInterval,
+          rowCount: rows.length,
+        });
         rows = aggregateCandles(rows, config.aggregateMs);
+        console.log('[candle] after aggregate', { interval, rowCount: rows.length });
       }
+      const bucketStart = bucketStartMs(Date.now(), bucketMs);
+      const completed = rows.filter((r: CandleRow) => (Date.parse(r.ts) || 0) < bucketStart);
+      console.log('[candle] history rows', {
+        interval,
+        completed: completed.length,
+        droppedFormingBucket: rows.length - completed.length,
+        firstTs: completed[0]?.ts ?? null,
+        lastTs: completed[completed.length - 1]?.ts ?? null,
+      });
       if (token !== tokenRef.current) {
         return null; // superseded by a newer key — drop
       }
-      handleRef.current?.setHistory(rows, { fit });
-      return rows;
+      handleRef.current?.setHistory(completed, { fit });
+      return completed;
+    };
+
+    // Refetch the finer sub-candles for the current bucket, then recompose the
+    // forming candle. Called on load, on bucket roll, on a timer, and on resync.
+    const refetchFiner = async (reason: string) => {
+      const now = Date.now();
+      const bucket = bucketStartMs(now, bucketMs);
+      formingBucketStartRef.current = bucket;
+      if (ladder.length === 0) {
+        finerRowsRef.current = {};
+        paintForming(true);
+        return;
+      }
+      try {
+        const rows = await getFinerCandlesForBucket(
+          supabase,
+          marketId,
+          ladder,
+          new Date(bucket).toISOString(),
+          new Date(now).toISOString()
+        );
+        if (token !== tokenRef.current) {
+          return;
+        }
+        finerRowsRef.current = rows;
+        console.log('[candle] finer refetch', {
+          reason,
+          interval,
+          bucketStart: new Date(bucket).toISOString(),
+          rowCounts: Object.fromEntries(ladder.map((iv) => [iv, rows[iv]?.length ?? 0])),
+        });
+        paintForming(true);
+      } catch (err) {
+        console.error('[candle] finer refetch failed:', err);
+      }
     };
 
     loadHistory(true)
@@ -138,7 +251,7 @@ export default function RealtimeOhlcvChart({
         }
         historyReadyRef.current = true;
         setStatus(rows.length ? 'ready' : 'empty');
-        scheduleFlush(); // paint any candle that formed while history loaded
+        void refetchFiner('initial'); // seed + paint the forming candle
       })
       .catch((err) => {
         if (token !== tokenRef.current) {
@@ -161,6 +274,7 @@ export default function RealtimeOhlcvChart({
         const rows = await loadHistory(false);
         if (rows != null) {
           setStatus(rows.length ? 'ready' : 'empty');
+          await refetchFiner('resync');
         }
       } catch (err) {
         console.error('[RealtimeOhlcvChart] resync failed:', err);
@@ -186,16 +300,23 @@ export default function RealtimeOhlcvChart({
         }
         const result = aggregator.ingest(event);
         if (!result) {
-          return;
+          return; // duplicate / late / out-of-order — dropped by the aggregator
         }
-        // On a boundary crossing, paint the just-closed candle immediately with
-        // its final aggregated values — rAF coalescing would otherwise skip it
-        // (the next frame paints only the new live candle). Rollovers are rare
-        // (once per bucket), so a direct update here is cheap.
-        if (result.sealed && historyReadyRef.current) {
-          handleRef.current?.updateLive(result.sealed);
+        console.log('[candle] live tick', {
+          interval,
+          ts: new Date(event.tsMs).toISOString(),
+          close: event.close,
+          volume: event.volume,
+        });
+        // Boundary crossed: the selected-interval bucket rolled. The just-closed
+        // bucket keeps its last-composed value (frozen on the chart); refetch the
+        // finer blocks for the new bucket and recompose from scratch.
+        const eventBucket = bucketStartMs(event.tsMs, bucketMs);
+        if (eventBucket !== formingBucketStartRef.current) {
+          void refetchFiner('bucket-roll');
+        } else {
+          scheduleFlush();
         }
-        scheduleFlush();
       },
       (connStatus) => {
         if (
@@ -211,14 +332,19 @@ export default function RealtimeOhlcvChart({
       }
     );
 
+    // Periodically pull in freshly-closed finer blocks so the forming candle
+    // keeps folding them in (and the live tail shrinks) even in a quiet market.
+    const finerTimer = setInterval(() => void refetchFiner('periodic'), FINER_REFETCH_MS);
+
     return () => {
       unsubscribe();
+      clearInterval(finerTimer);
       if (rafRef.current != null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
     };
-  }, [marketId, interval, scheduleFlush]);
+  }, [marketId, interval, scheduleFlush, paintForming]);
 
   return (
     <div ref={wrapperRef} className="chart-wrap">

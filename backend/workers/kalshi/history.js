@@ -224,11 +224,19 @@ async function backfillMarketGroup(markets, stateByMarket) {
       '1m': toCandleRows(market.id, '1m', candles1m),
     };
 
+    // Source candle arrays (pre-row shape) per interval, so the coarser
+    // intervals (15m/4h/1w) can be rolled up from the nearest finer source.
+    let candles5m = [];
+    let candles1h = [];
+    let candles1d = [];
+
     if (candles1m.length > 0) {
-      candleRowsByInterval['5m'] = toCandleRows(
+      candles5m = aggregateToInterval(candles1m, '1m', '5m');
+      candleRowsByInterval['5m'] = toCandleRows(market.id, '5m', candles5m);
+      candleRowsByInterval['15m'] = toCandleRows(
         market.id,
-        '5m',
-        aggregateToInterval(candles1m, '1m', '5m')
+        '15m',
+        aggregateToInterval(candles1m, '1m', '15m')
       );
     }
 
@@ -240,11 +248,8 @@ async function backfillMarketGroup(markets, stateByMarket) {
         window1h.endTs,
         KALSHI_PERIOD_MINUTES['1h']
       );
-      candleRowsByInterval['1h'] = toCandleRows(
-        market.id,
-        '1h',
-        candles1hMap.get(market.external_id) ?? []
-      );
+      candles1h = candles1hMap.get(market.external_id) ?? [];
+      candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', candles1h);
 
       const window1d = getFetchWindow(true, '1d');
       const candles1dMap = await fetchCandlesForTickers(
@@ -253,21 +258,29 @@ async function backfillMarketGroup(markets, stateByMarket) {
         window1d.endTs,
         KALSHI_PERIOD_MINUTES['1d']
       );
-      candleRowsByInterval['1d'] = toCandleRows(
-        market.id,
-        '1d',
-        candles1dMap.get(market.external_id) ?? []
-      );
+      candles1d = candles1dMap.get(market.external_id) ?? [];
+      candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', candles1d);
     } else if (candles1m.length > 0) {
-      candleRowsByInterval['1h'] = toCandleRows(
+      candles1h = aggregateToInterval(candles1m, '1m', '1h');
+      candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', candles1h);
+      candles1d = aggregateToInterval(candles1m, '1m', '1d');
+      candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', candles1d);
+    }
+
+    // 4h rolls up from 1h, 1w from 1d — whichever source (fetched or derived)
+    // we ended up with above.
+    if (candles1h.length > 0) {
+      candleRowsByInterval['4h'] = toCandleRows(
         market.id,
-        '1h',
-        aggregateToInterval(candles1m, '1m', '1h')
+        '4h',
+        aggregateToInterval(candles1h, '1h', '4h')
       );
-      candleRowsByInterval['1d'] = toCandleRows(
+    }
+    if (candles1d.length > 0) {
+      candleRowsByInterval['1w'] = toCandleRows(
         market.id,
-        '1d',
-        aggregateToInterval(candles1m, '1m', '1d')
+        '1w',
+        aggregateToInterval(candles1d, '1d', '1w')
       );
     }
 

@@ -9,15 +9,29 @@ const TOKEN_EVICTION_MS = 24 * 60 * 60 * 1000;
 const INTERVAL_MS = {
   '1m': 60 * 1000,
   '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
   '1h': 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
   '1d': 24 * 60 * 60 * 1000,
+  '1w': 7 * 24 * 60 * 60 * 1000,
 };
 
 const AGGREGATION_CHAIN = {
   '5m': '1m',
-  '1h': '5m',
-  '1d': '1h',
+  '15m': '5m',
+  '1h': '15m',
+  '4h': '1h',
+  '1d': '4h',
+  '1w': '1d',
 };
+
+/**
+ * Ordered interval ladder for `aggregateToInterval`. Each entry is an exact
+ * integer multiple of the one before (5→15→60→240→1440→10080 minutes), so
+ * rolling up through the chain re-buckets cleanly at every step and lands on
+ * the same boundaries as a direct floor to the target interval.
+ */
+const INTERVAL_ORDER = ['1m', '5m', '15m', '1h', '4h', '1d', '1w'];
 
 function getBucketMs(interval) {
   const ms = INTERVAL_MS[interval];
@@ -189,7 +203,7 @@ function aggregateCandles(sourceCandles, targetInterval) {
  * Roll up candles through the chain (e.g. 1m → 5m → 1h → 1d).
  */
 function aggregateToInterval(sourceCandles, sourceInterval, targetInterval) {
-  const order = ['1m', '5m', '1h', '1d'];
+  const order = INTERVAL_ORDER;
   const fromIdx = order.indexOf(sourceInterval);
   const toIdx = order.indexOf(targetInterval);
 
@@ -209,6 +223,7 @@ module.exports = {
   TOKEN_EVICTION_MS,
   INTERVAL_MS,
   AGGREGATION_CHAIN,
+  INTERVAL_ORDER,
   getBucketMs,
   floorToBucket,
   normalizeEpochMs,

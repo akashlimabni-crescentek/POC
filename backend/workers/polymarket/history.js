@@ -248,11 +248,21 @@ async function backfillMarket(market, ingestionState) {
     trade_count: row.trade_count,
   }));
 
+  // Source candle arrays (aggregate shape) so 15m/4h/1w can be rolled up from
+  // the nearest finer source, whichever way 1h/1d were obtained.
+  let source1h = [];
+  let source1d = [];
+
   if (source1m.length > 0) {
     candleRowsByInterval['5m'] = toCandleRows(
       market.id,
       '5m',
       aggregateToInterval(source1m, '1m', '5m')
+    );
+    candleRowsByInterval['15m'] = toCandleRows(
+      market.id,
+      '15m',
+      aggregateToInterval(source1m, '1m', '15m')
     );
   }
 
@@ -262,24 +272,36 @@ async function backfillMarket(market, ingestionState) {
       interval: '1h',
       fidelity: 60,
     });
-    candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', clobPointsToCandles(points1h));
+    source1h = clobPointsToCandles(points1h);
+    candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', source1h);
 
     const window1d = getFetchWindow(true, '1d');
     const points1d = await fetchClobHistory(tokenId, window1d.startTs, window1d.endTs, {
       interval: '1d',
       fidelity: 1440,
     });
-    candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', clobPointsToCandles(points1d));
+    source1d = clobPointsToCandles(points1d);
+    candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', source1d);
   } else if (source1m.length > 0) {
-    candleRowsByInterval['1h'] = toCandleRows(
+    source1h = aggregateToInterval(source1m, '1m', '1h');
+    candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', source1h);
+    source1d = aggregateToInterval(source1m, '1m', '1d');
+    candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', source1d);
+  }
+
+  // 4h rolls up from 1h, 1w from 1d.
+  if (source1h.length > 0) {
+    candleRowsByInterval['4h'] = toCandleRows(
       market.id,
-      '1h',
-      aggregateToInterval(source1m, '1m', '1h')
+      '4h',
+      aggregateToInterval(source1h, '1h', '4h')
     );
-    candleRowsByInterval['1d'] = toCandleRows(
+  }
+  if (source1d.length > 0) {
+    candleRowsByInterval['1w'] = toCandleRows(
       market.id,
-      '1d',
-      aggregateToInterval(source1m, '1m', '1d')
+      '1w',
+      aggregateToInterval(source1d, '1d', '1w')
     );
   }
 
