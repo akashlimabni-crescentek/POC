@@ -184,9 +184,18 @@ export default function RealtimeOhlcvChart({
         if (!event) {
           return;
         }
-        if (aggregator.ingest(event)) {
-          scheduleFlush();
+        const result = aggregator.ingest(event);
+        if (!result) {
+          return;
         }
+        // On a boundary crossing, paint the just-closed candle immediately with
+        // its final aggregated values — rAF coalescing would otherwise skip it
+        // (the next frame paints only the new live candle). Rollovers are rare
+        // (once per bucket), so a direct update here is cheap.
+        if (result.sealed && historyReadyRef.current) {
+          handleRef.current?.updateLive(result.sealed);
+        }
+        scheduleFlush();
       },
       (connStatus) => {
         if (

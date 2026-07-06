@@ -13,6 +13,7 @@ export type CandleEvent = {
   high: number;
   low: number;
   close: number;
+  mid: number | null;
   volume: number;
 };
 
@@ -43,7 +44,7 @@ export function marketPriceToEvent(row: MarketPriceLatest): CandleEvent | null {
   if (Number.isNaN(tsMs)) {
     return null;
   }
-  return { id: tsMs, tsMs, open: price, high: price, low: price, close: price, volume: 0 };
+  return { id: tsMs, tsMs, open: price, high: price, low: price, close: price, mid: row.mid, volume: 0 };
 }
 
 /**
@@ -61,14 +62,21 @@ export function liveTickToEvent(row: LiveTickRow): CandleEvent | null {
     return null;
   }
   const id = row.id ?? tsMs;
-  return { id, tsMs, open: price, high: price, low: price, close: price, volume: row.volume ?? 0 };
+  return { id, tsMs, open: price, high: price, low: price, close: price, mid: row.mid, volume: row.volume ?? 0 };
 }
+
+/**
+ * A forming candle plus the aggregated `mid` average. Kept separate from
+ * `CandleRow` (which mirrors the DB `candles` table) so the live-only `mid`
+ * field never leaks into historical/persisted rows.
+ */
+export type LiveCandle = CandleRow & { mid: number | null };
 
 export type IngestResult = {
   /** The current, still-forming candle after applying the event. */
-  live: CandleRow;
+  live: LiveCandle;
   /** Non-null only when this event crossed a boundary — the just-closed candle. */
-  sealed: CandleRow | null;
+  sealed: LiveCandle | null;
 };
 
 /**
@@ -89,9 +97,13 @@ export class CandleAggregator {
   private readonly interval: string;
   private readonly bucketMs: number;
 
-  private live: CandleRow | null = null;
+  private live: LiveCandle | null = null;
   private liveBucketStart: number | null = null;
   private lastEventId = Number.NEGATIVE_INFINITY;
+
+  // Running accumulators for the current bucket's mid average.
+  private midSum = 0;
+  private midCount = 0;
 
   constructor(marketId: number, interval: string, bucketMs: number) {
     this.marketId = marketId;
@@ -100,7 +112,7 @@ export class CandleAggregator {
   }
 
   /** The current forming candle, or null before the first event arrives. */
-  get current(): CandleRow | null {
+  get current(): LiveCandle | null {
     return this.live;
   }
 
@@ -109,6 +121,8 @@ export class CandleAggregator {
     this.live = null;
     this.liveBucketStart = null;
     this.lastEventId = Number.NEGATIVE_INFINITY;
+    this.midSum = 0;
+    this.midCount = 0;
   }
 
   ingest(event: CandleEvent): IngestResult | null {
@@ -144,18 +158,28 @@ export class CandleAggregator {
     }
 
     // 5. Same bucket → fold the event in. Open is left untouched (first-write-wins).
+    if (event.mid != null && Number.isFinite(event.mid)) {
+      this.midSum += event.mid;
+      this.midCount += 1;
+    }
     this.live = {
       ...this.live,
       high: Math.max(this.live.high ?? event.high, event.high),
       low: Math.min(this.live.low ?? event.low, event.low),
       close: event.close,
+      // Mid = average of all mid values seen so far this bucket.
+      mid: this.midCount ? this.midSum / this.midCount : this.live.mid,
       volume: (this.live.volume ?? 0) + event.volume,
       trade_count: (this.live.trade_count ?? 0) + 1,
     };
     return { live: this.live, sealed: null };
   }
 
-  private startCandle(bucketStart: number, event: CandleEvent): CandleRow {
+  private startCandle(bucketStart: number, event: CandleEvent): LiveCandle {
+    // Reset the mid accumulators for the new bucket, seeding with this event.
+    this.midSum = event.mid != null && Number.isFinite(event.mid) ? event.mid : 0;
+    this.midCount = event.mid != null && Number.isFinite(event.mid) ? 1 : 0;
+
     return {
       market_id: this.marketId,
       interval: this.interval,
@@ -164,6 +188,7 @@ export class CandleAggregator {
       high: event.high,
       low: event.low,
       close: event.close,
+      mid: this.midCount ? this.midSum / this.midCount : null,
       volume: event.volume,
       trade_count: 1,
     };
