@@ -325,6 +325,10 @@ export function createMultiLineChart(
 
 export type OhlcvChartHandle = {
   setCandles: (rows: CandleRow[], options?: ChartSetOptions) => void;
+  /** Replace the full historical series in one `setData` call (load / resync). */
+  setHistory: (rows: CandleRow[], options?: ChartSetOptions) => void;
+  /** Patch only the trailing live candle via `series.update` (per realtime tick). */
+  updateLive: (row: CandleRow) => void;
   resize: (width: number, height: number) => void;
   destroy: () => void;
 };
@@ -456,6 +460,47 @@ export function createOhlcvChart(
         chart.timeScale().fitContent();
       } else {
         restoreVisibleRange(chart, visibleRange);
+      }
+    },
+    // Immutable history path: always a single setData. Called once per load and
+    // on resync — never on a realtime tick.
+    setHistory(rows, options = {}) {
+      const fit = options.fit === true;
+      const visibleRange = fit ? null : chart.timeScale().getVisibleLogicalRange();
+
+      candleByTime = new Map();
+      for (const row of rows) {
+        const t = Math.floor(Date.parse(row.ts) / 1000);
+        if (!Number.isNaN(t)) {
+          candleByTime.set(t, row);
+        }
+      }
+
+      const chartCandles = toChartCandles(rows);
+      candleSeries.setData(chartCandles);
+      volumeSeries.setData(toVolumeBars(rows));
+      lastChartCandles = chartCandles;
+
+      if (fit) {
+        chart.timeScale().fitContent();
+      } else {
+        restoreVisibleRange(chart, visibleRange);
+      }
+    },
+    // Live path: patch only the trailing candle. `series.update` requires
+    // time >= the last point, which the seam invariant (live bucket is always
+    // the newest) guarantees. O(1) and preserves the user's zoom/pan.
+    updateLive(row) {
+      const [candle] = toChartCandles([row]);
+      if (!candle) {
+        return;
+      }
+      candleByTime.set(candle.time as number, row);
+      candleSeries.update(candle);
+
+      const [volume] = toVolumeBars([row]);
+      if (volume) {
+        volumeSeries.update(volume);
       }
     },
     resize(width, nextHeight) {

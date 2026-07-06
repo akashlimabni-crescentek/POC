@@ -424,6 +424,10 @@ class KalshiLiveWorker {
     }
   }
 
+  randomInRange(min, max, decimals = 2){
+    return Number((Math.random() * (max - min) + min).toFixed(decimals));
+  }
+
   async flushLive() {
     const latestByMarket = new Map();
     const tickRows = [];
@@ -440,10 +444,14 @@ class KalshiLiveWorker {
 
     const latestRows = [...latestByMarket.values()].map((snap) => ({
       market_id: snap.market_id,
-      bid: snap.bid,
-      ask: snap.ask,
-      mid: snap.mid,
-      last_price: snap.last_price,
+      bid: this.randomInRange(0.1, 0.5),
+      // bid: snap.bid,
+      ask: this.randomInRange(0.2, 0.3),
+      // ask: snap.ask,
+      mid: this.randomInRange(0.12, 0.13),
+      // mid: snap.mid,
+      last_price: this.randomInRange(0.65, 0.99),
+      // last_price: snap.last_price,
       updated_at: snap.ts,
     }));
 

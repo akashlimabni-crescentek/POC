@@ -4,17 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createBrowserClient } from '@/lib/supabase/client';
 import { getCandles, pickLatestPrice } from '@/lib/queries';
 import { getMarketDisplayName } from '@/lib/market-label';
-import { aggregateCandles } from '@/lib/candle-aggregate';
-import { applyLiveTickToCandles } from '@/lib/live-tick-candles';
-import { subscribeLiveTicks, subscribeMarketPricesMany } from '@/lib/realtime';
+import { subscribeMarketPricesMany } from '@/lib/realtime';
 import {
   LINE_TIME_RANGES,
   OHLCV_INTERVALS,
-  OHLCV_SOURCE,
   lineRangeToWindow,
   lineSourceInterval,
-  ohlcvBucketMs,
-  ohlcvRangeToWindow,
   outcomeColor,
   type ChartMode,
   type LineTimeRange,
@@ -22,8 +17,8 @@ import {
 } from '@/lib/chart-config';
 import { toLinePoints, type ChartLinePoint, type LineSeriesInput } from '@/lib/chart';
 import MultiLineChart from '@/components/MultiLineChart';
-import OhlcvChart from '@/components/OhlcvChart';
-import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
+import RealtimeOhlcvChart from '@/components/RealtimeOhlcvChart';
+import type { MarketPriceLatest, MarketRow } from '@/lib/types';
 
 const DEFAULT_LINE_VISIBLE = 4;
 
@@ -82,9 +77,7 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
   const [visibleIds, setVisibleIds] = useState<Set<number>>(new Set());
   const [selectedMarketId, setSelectedMarketId] = useState<number | null>(null);
   const [lineSeries, setLineSeries] = useState<LineSeriesInput[]>([]);
-  const [ohlcvCandles, setOhlcvCandles] = useState<CandleRow[]>([]);
   const [lineResetKey, setLineResetKey] = useState('');
-  const [ohlcvResetKey, setOhlcvResetKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -157,44 +150,11 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
     }
   }, [visibleIds, lineRange, marketById, colorById, eventTitle]);
 
-  const loadOhlcvData = useCallback(async () => {
-    if (selectedMarketId == null) {
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    try {
-      const supabase = createBrowserClient();
-      const config = OHLCV_SOURCE[ohlcvInterval];
-      const { from, to } = ohlcvRangeToWindow(ohlcvInterval);
-      let rows = await getCandles(supabase, selectedMarketId, config.sourceInterval, from, to);
-
-      if (config.aggregateMs) {
-        rows = aggregateCandles(rows, config.aggregateMs);
-      }
-
-      setOhlcvCandles(rows);
-      setOhlcvResetKey(`${selectedMarketId}-${ohlcvInterval}`);
-    } catch (err) {
-      console.error('[EventChart] ohlcv load failed:', err);
-      setError('Failed to load chart data');
-      setOhlcvCandles([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [selectedMarketId, ohlcvInterval]);
-
   useEffect(() => {
     if (mode === 'line' && visibleIds.size > 0) {
       loadLineData();
     }
   }, [mode, loadLineData, visibleIds.size]);
-
-  useEffect(() => {
-    if (mode === 'ohlcv' && selectedMarketId != null) {
-      loadOhlcvData();
-    }
-  }, [mode, loadOhlcvData, selectedMarketId]);
 
   useEffect(() => {
     if (mode !== 'line' || visibleIds.size === 0) {
@@ -213,19 +173,6 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
       }
     );
   }, [mode, visibleIds]);
-
-  useEffect(() => {
-    if (mode !== 'ohlcv' || selectedMarketId == null) {
-      return;
-    }
-
-    const supabase = createBrowserClient();
-
-    return subscribeLiveTicks(supabase, selectedMarketId, (tick) => {
-      const bucketMs = ohlcvBucketMs(ohlcvInterval);
-      setOhlcvCandles((prev) => applyLiveTickToCandles(prev, tick, bucketMs));
-    });
-  }, [mode, selectedMarketId, ohlcvInterval]);
 
   if (!markets.length) {
     return null;
@@ -335,18 +282,12 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
         </div>
       )}
 
-      {!loading && !error && mode === 'ohlcv' && ohlcvCandles.length === 0 && (
-        <div className="status-banner status-banner-warn">
-          No OHLCV data yet — promote this event to hot and wait for history backfill.
-        </div>
-      )}
-
       {!loading && mode === 'line' && lineSeries.length > 0 && (
         <MultiLineChart lines={lineSeries} resetKey={lineResetKey} />
       )}
 
-      {!loading && mode === 'ohlcv' && ohlcvCandles.length > 0 && (
-        <OhlcvChart candles={ohlcvCandles} resetKey={ohlcvResetKey} />
+      {mode === 'ohlcv' && (
+        <RealtimeOhlcvChart marketId={selectedMarketId} interval={ohlcvInterval} />
       )}
     </div>
   );

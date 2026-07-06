@@ -179,6 +179,39 @@ export function subscribeMarketPricesMany(
   return subscribeTableMany(supabase, channelKey, 'market_prices_latest', marketIds, onUpdate);
 }
 
+/**
+ * Subscribe to market_prices_latest for a single market, exposing channel
+ * status transitions so the caller can resync after a reconnect. The realtime
+ * client auto-reconnects the socket, but events during the outage are missed —
+ * the status callback is how the chart knows to refetch and reseed.
+ */
+export function subscribeMarketPricesWithStatus(
+  supabase: SupabaseClient,
+  marketId: number,
+  onUpdate: PostgresHandler<MarketPriceLatest>,
+  onStatus?: (status: string) => void
+): RealtimeUnsubscribe {
+  const channelName = `market-prices-live-${marketId}`;
+  const table = 'market_prices_latest' as const;
+
+  const channel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table, filter: `market_id=eq.${marketId}` },
+      (payload) => handlePayload(channelName, table, payload, onUpdate)
+    )
+    .subscribe((status, err) => {
+      logSubscribeStatus(table, channelName, [marketId], status, err);
+      onStatus?.(status);
+    });
+
+  return () => {
+    console.log(`${LOG} unsubscribed`, { channel: channelName, table, marketIds: [marketId] });
+    supabase.removeChannel(channel);
+  };
+}
+
 /** Subscribe to live_ticks for a single market. */
 export function subscribeLiveTicks(
   supabase: SupabaseClient,
