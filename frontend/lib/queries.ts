@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { createBrowserClient } from './supabase/client';
+import { logCandleRows, logCandleRowsByInterval } from './candle-debug';
 import { pickRelation } from './utils';
 import type {
   CandleInterval,
@@ -150,12 +151,14 @@ export async function getCandles(
     from ?? new Date(now - CANDLE_LOOKBACK_MS[interval]).toISOString();
   const toIso = to ?? new Date(now).toISOString();
 
-  console.log('[candle] DB query', {
-    kind: 'history',
+  console.log('[candle] getCandles → DB query', {
+    source: 'history-table',
+    fn: 'getCandles',
     market_id: marketId,
     interval,
     from: fromIso,
     to: toIso,
+    note: 'Completed historical bars (forming bucket is stripped client-side)',
   });
 
   const { data, error } = await supabase
@@ -172,17 +175,18 @@ export async function getCandles(
   }
 
   const rows = data ?? [];
-  console.log('[candle] DB result', {
-    kind: 'history',
+  logCandleRows('[candle] getCandles ← DB result', rows, {
+    source: 'history-table',
+    fn: 'getCandles',
     market_id: marketId,
     interval,
-    rowCount: rows.length,
-    firstTs: rows[0]?.ts ?? null,
-    lastTs: rows[rows.length - 1]?.ts ?? null,
+    from: fromIso,
+    to: toIso,
   });
 
   return rows;
 }
+
 
 /**
  * Fetch the finer stored candles that fall inside the current forming bucket,
@@ -195,7 +199,8 @@ export async function getFinerCandlesForBucket(
   marketId: number,
   ladder: CandleInterval[],
   bucketStartIso: string,
-  toIso: string
+  toIso: string,
+  meta?: { reason?: string; callSeq?: number }
 ): Promise<Record<string, CandleRow[]>> {
   const byInterval: Record<string, CandleRow[]> = {};
   for (const iv of ladder) {
@@ -206,12 +211,16 @@ export async function getFinerCandlesForBucket(
     return byInterval;
   }
 
-  console.log('[candle] DB query', {
-    kind: 'forming-bucket',
+  console.log('[candle] getFinerCandlesForBucket → DB query', {
+    source: 'history-table',
+    fn: 'getFinerCandlesForBucket',
+    reason: meta?.reason ?? 'unknown',
+    callSeq: meta?.callSeq ?? null,
     market_id: marketId,
     intervals: ladder,
-    from: bucketStartIso,
-    to: toIso,
+    bucketFrom: bucketStartIso,
+    bucketTo: toIso,
+    note: 'Finer stored candles inside the current forming bucket (not the completed history bars)',
   });
 
   const { data, error } = await supabase
@@ -231,11 +240,16 @@ export async function getFinerCandlesForBucket(
     (byInterval[row.interval] ??= []).push(row);
   }
 
-  console.log('[candle] DB result', {
-    kind: 'forming-bucket',
-    market_id: marketId,
-    rowCounts: Object.fromEntries(ladder.map((iv) => [iv, byInterval[iv]?.length ?? 0])),
-  });
+  // logCandleRowsByInterval('[candle] getFinerCandlesForBucket ← DB result', byInterval, {
+  //   source: 'history-table',
+  //   fn: 'getFinerCandlesForBucket',
+  //   reason: meta?.reason ?? 'unknown',
+  //   callSeq: meta?.callSeq ?? null,
+  //   market_id: marketId,
+  //   bucketFrom: bucketStartIso,
+  //   bucketTo: toIso,
+  //   totalRows: (data ?? []).length,
+  // });
 
   return byInterval;
 }

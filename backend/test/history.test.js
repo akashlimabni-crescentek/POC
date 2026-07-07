@@ -2,15 +2,40 @@ import { describe, it, expect } from 'vitest';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { getFetchWindow, mergeLastCandleTs } = require('../lib/history-common');
+const {
+  getFetchWindow,
+  getFirstBackfillWindow,
+  getLastClosedBucketWindowSec,
+  isIntervalDue,
+  mergeLastCandleTs,
+} = require('../lib/history-common');
 const { tradesTo1mCandles, clobPointsToCandles } = require('../workers/polymarket/history');
 const { mapKalshiCandlestick } = require('../workers/kalshi/history');
 
 describe('history-common', () => {
   it('getFetchWindow uses deep lookback on first backfill', () => {
     const first = getFetchWindow(true, '1d');
-    const inc = getFetchWindow(false, '1d');
+    const inc = getFetchWindow(false, '1m');
     expect(first.endTs - first.startTs).toBeGreaterThan(inc.endTs - inc.startTs);
+  });
+
+  it('getLastClosedBucketWindowSec returns one 5m bucket', () => {
+    // 2026-07-07 09:22:00 UTC → last closed 5m bucket ends at 09:20
+    const nowSec = Math.floor(Date.parse('2026-07-07T09:22:00.000Z') / 1000);
+    const win = getLastClosedBucketWindowSec('5m', nowSec);
+    expect(win.startTs).toBe(Math.floor(Date.parse('2026-07-07T09:15:00.000Z') / 1000));
+    expect(win.endTs).toBe(Math.floor(Date.parse('2026-07-07T09:20:00.000Z') / 1000));
+  });
+
+  it('isIntervalDue when last candle is older than last closed bucket', () => {
+    const nowSec = Math.floor(Date.parse('2026-07-07T09:22:00.000Z') / 1000);
+    expect(isIntervalDue('5m', '2026-07-07T09:10:00.000Z', nowSec)).toBe(true);
+    expect(isIntervalDue('5m', '2026-07-07T09:15:00.000Z', nowSec)).toBe(false);
+  });
+
+  it('getFirstBackfillWindow covers configured lookback for 5m', () => {
+    const win = getFirstBackfillWindow('5m');
+    expect(win.endTs - win.startTs).toBe(30 * 24 * 60 * 60);
   });
 
   it('splitTimeWindowsForCandles respects Kalshi 10k candlestick cap', () => {

@@ -126,18 +126,15 @@ export function ohlcvBucketMs(interval: OhlcvInterval): number {
  * here must be an integer divisor of the selected interval and of the rung
  * above it, so blocks tile the bucket exactly.
  *
- * All of 1m/5m/15m/1h/4h/1d are persisted, so each selected interval steps
- * down through every finer stored interval — the coarsest blocks fill most of
- * the bucket in a single row each, leaving the live aggregator only the last
- * sub-minute sliver.
+ * finer intervals are aggregated transiently and never stored as 1m.
  */
 export const SUB_INTERVAL_LADDER: Record<OhlcvInterval, CandleInterval[]> = {
-  '5m': ['1m'],
-  '15m': ['5m', '1m'],
-  '1H': ['15m', '5m', '1m'],
-  '4H': ['1h', '15m', '5m', '1m'],
-  '1D': ['4h', '1h', '15m', '5m', '1m'],
-  '1W': ['1d', '4h', '1h', '15m', '5m', '1m'],
+  '5m': [],
+  '15m': ['5m'],
+  '1H': ['15m', '5m'],
+  '4H': ['1h', '15m', '5m'],
+  '1D': ['4h', '1h', '15m', '5m'],
+  '1W': ['1d', '4h', '1h', '15m', '5m'],
 };
 
 export function outcomeColor(index: number): string {

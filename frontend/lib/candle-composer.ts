@@ -133,11 +133,12 @@ export function buildFormingCandle(params: {
 
   if (pieces.length === 0) {
     if (shouldLog) {
-      console.log('[candle] compose', {
+      console.log('[candle] compose forming candle', {
         interval,
         bucketStart: new Date(bucketStart).toISOString(),
         now: new Date(nowMs).toISOString(),
         result: 'no pieces — forming candle empty',
+        sources: { historyTable: [], realtime: [] },
       });
     }
     return { candle: null, pieces };
@@ -171,23 +172,42 @@ export function buildFormingCandle(params: {
   };
 
   if (shouldLog) {
-    console.log('[candle] compose', {
+    const dbPieces = pieces.filter((p) => p.src.startsWith('db:'));
+    const livePieces = pieces.filter((p) => p.src === 'live');
+    const dbRows = dbPieces.map((p) => ({
+      src: p.src,
+      from: new Date(p.fromMs).toISOString(),
+      to: new Date(p.toMs).toISOString(),
+      o: p.open,
+      h: p.high,
+      l: p.low,
+      c: p.close,
+      v: p.volume,
+    }));
+    const liveRows = livePieces.map((p) => ({
+      from: new Date(p.fromMs).toISOString(),
+      to: new Date(p.toMs).toISOString(),
+      o: p.open,
+      h: p.high,
+      l: p.low,
+      c: p.close,
+      v: p.volume,
+    }));
+    console.log('[candle] compose forming candle', {
       interval,
       bucketStart: new Date(bucketStart).toISOString(),
       now: new Date(nowMs).toISOString(),
       ladder,
-      pieces: pieces.map((p) => ({
-        src: p.src,
-        from: new Date(p.fromMs).toISOString(),
-        to: new Date(p.toMs).toISOString(),
-        o: p.open,
-        h: p.high,
-        l: p.low,
-        c: p.close,
-        v: p.volume,
-      })),
       merged: { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume },
     });
+    if (dbRows.length > 0) {
+      console.log('[candle] compose — history-table pieces', dbRows);
+      console.table(dbRows);
+    }
+    if (liveRows.length > 0) {
+      console.log('[candle] compose — realtime pieces', liveRows);
+      console.table(liveRows);
+    }
   }
 
   return { candle, pieces };

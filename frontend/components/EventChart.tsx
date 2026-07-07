@@ -285,7 +285,7 @@ export default function EventChart({ eventTitle, markets }: EventChartProps) {
       {!loading && mode === 'line' && lineSeries.length > 0 && (
         <MultiLineChart lines={lineSeries} resetKey={lineResetKey} />
       )}
-
+      {console.log('ohlcvInterval ===>', ohlcvInterval, selectedMarketId, mode)}
       {mode === 'ohlcv' && (
         <RealtimeOhlcvChart marketId={selectedMarketId} interval={ohlcvInterval} />
       )}

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createBrowserClient } from '@/lib/supabase/client';
 import { getCandles, getFinerCandlesForBucket } from '@/lib/queries';
+import { formatCandleRowForLog, logCandleRows, logCandleRowsByInterval } from '@/lib/candle-debug';
 import { aggregateCandles } from '@/lib/candle-aggregate';
 import { createOhlcvChart, type OhlcvChartHandle } from '@/lib/chart';
 import { CandleAggregator, bucketStartMs, marketPriceToEvent } from '@/lib/candle-aggregator';
@@ -128,15 +129,12 @@ export default function RealtimeOhlcvChart({
     }
     handle.updateLive(candle);
     if (log) {
-      console.log('[candle] chart update', {
+      console.log('[candle] chart update (forming candle)', {
+        source: 'composed',
         interval: cfg.interval,
-        ts: candle.ts,
-        o: candle.open,
-        h: candle.high,
-        l: candle.low,
-        c: candle.close,
-        v: candle.volume,
+        row: formatCandleRowForLog(candle),
       });
+      console.table([formatCandleRowForLog(candle)]);
     }
   }, []);
 
@@ -175,6 +173,20 @@ export default function RealtimeOhlcvChart({
     configRef.current = { marketId, interval, bucketMs, ladder };
     finerRowsRef.current = {};
     formingBucketStartRef.current = null;
+    let finerFetchSeq = 0;
+
+    // getFinerCandlesForBucket is called from refetchFiner on purpose in four cases:
+    //   initial      — once after history loads, to seed the forming candle
+    //   bucket-roll  — when a realtime tick crosses into a new bucket
+    //   periodic     — every FINER_REFETCH_MS so newly-closed finer blocks fold in
+    //   resync       — after websocket reconnect
+    console.log('[candle] chart session start', {
+      marketId,
+      interval,
+      ladder,
+      finerRefetchIntervalMs: FINER_REFETCH_MS,
+      refetchTriggers: ['initial', 'bucket-roll', 'periodic', 'resync'],
+    });
 
     // Fetch immutable history for the active key and hand it to the chart once.
     // Any row at/after the current bucket start is dropped — that bucket is the
@@ -185,23 +197,44 @@ export default function RealtimeOhlcvChart({
       const { from, to } = ohlcvRangeToWindow(interval);
       let rows = await getCandles(supabase, marketId, config.sourceInterval, from, to);
       if (config.aggregateMs) {
-        console.log('[candle] before aggregate', {
+        console.log('[candle] history aggregate', {
+          source: 'history-table',
           interval,
           sourceInterval: config.sourceInterval,
-          rowCount: rows.length,
+          rowCountBefore: rows.length,
         });
         rows = aggregateCandles(rows, config.aggregateMs);
-        console.log('[candle] after aggregate', { interval, rowCount: rows.length });
+        console.log('[candle] history aggregate done', {
+          source: 'history-table',
+          interval,
+          rowCountAfter: rows.length,
+        });
       }
       const bucketStart = bucketStartMs(Date.now(), bucketMs);
       const completed = rows.filter((r: CandleRow) => (Date.parse(r.ts) || 0) < bucketStart);
-      console.log('[candle] history rows', {
+      const droppedForming = rows.filter((r: CandleRow) => (Date.parse(r.ts) || 0) >= bucketStart);
+      console.log('[candle] history → chart split', {
+        source: 'history-table',
         interval,
-        completed: completed.length,
-        droppedFormingBucket: rows.length - completed.length,
-        firstTs: completed[0]?.ts ?? null,
-        lastTs: completed[completed.length - 1]?.ts ?? null,
+        sourceInterval: config.sourceInterval,
+        totalFromDb: rows.length,
+        completedToChart: completed.length,
+        droppedFormingBucket: droppedForming.length,
+        formingBucketStart: new Date(bucketStart).toISOString(),
+        note: 'Dropped rows belong to the forming bucket — rebuilt via getFinerCandlesForBucket + realtime',
       });
+      logCandleRows('[candle] history → chart (completed rows)', completed, {
+        source: 'history-table',
+        interval,
+        role: 'setHistory',
+      });
+      if (droppedForming.length > 0) {
+        logCandleRows('[candle] history → dropped (forming bucket rows)', droppedForming, {
+          source: 'history-table',
+          interval,
+          role: 'excluded-from-setHistory',
+        });
+      }
       if (token !== tokenRef.current) {
         return null; // superseded by a newer key — drop
       }
@@ -212,11 +245,27 @@ export default function RealtimeOhlcvChart({
     // Refetch the finer sub-candles for the current bucket, then recompose the
     // forming candle. Called on load, on bucket roll, on a timer, and on resync.
     const refetchFiner = async (reason: string) => {
+      const callSeq = ++finerFetchSeq;
       const now = Date.now();
       const bucket = bucketStartMs(now, bucketMs);
       formingBucketStartRef.current = bucket;
+      console.log('[candle] refetchFiner called', {
+        reason,
+        callSeq,
+        interval,
+        marketId,
+        bucketStart: new Date(bucket).toISOString(),
+        ladder,
+        whyMultipleCalls:
+          'initial=after history load; bucket-roll=new bucket from WS tick; periodic=every 15s; resync=after reconnect',
+      });
       if (ladder.length === 0) {
         finerRowsRef.current = {};
+        console.log('[candle] refetchFiner skipped DB — no finer ladder for interval', {
+          reason,
+          callSeq,
+          interval,
+        });
         paintForming(true);
         return;
       }
@@ -226,21 +275,45 @@ export default function RealtimeOhlcvChart({
           marketId,
           ladder,
           new Date(bucket).toISOString(),
-          new Date(now).toISOString()
+          new Date(now).toISOString(),
+          { reason, callSeq }
         );
         if (token !== tokenRef.current) {
           return;
         }
         finerRowsRef.current = rows;
-        console.log('[candle] finer refetch', {
+        const liveTail = aggregatorRef.current?.current ?? null;
+        console.log('[candle] refetchFiner done — forming candle inputs', {
           reason,
+          callSeq,
           interval,
           bucketStart: new Date(bucket).toISOString(),
-          rowCounts: Object.fromEntries(ladder.map((iv) => [iv, rows[iv]?.length ?? 0])),
         });
+        // logCandleRowsByInterval('[candle] refetchFiner — history-table rows', rows, {
+        //   source: 'history-table',
+        //   reason,
+        //   callSeq,
+        // });
+        if (liveTail) {
+          // console.log('[candle] refetchFiner — realtime live tail', {
+          //   source: 'realtime-ws',
+          //   reason,
+          //   callSeq,
+          //   row: formatCandleRowForLog(liveTail),
+          // });
+          // console.table([formatCandleRowForLog(liveTail)]);
+        } else {
+          // console.log('[candle] refetchFiner — realtime live tail', {
+          //   source: 'realtime-ws',
+          //   reason,
+          //   callSeq,
+          //   row: null,
+          //   note: 'No websocket ticks ingested yet for this bucket',
+          // });
+        }
         paintForming(true);
       } catch (err) {
-        console.error('[candle] finer refetch failed:', err);
+        console.error('[candle] refetchFiner failed:', { reason, callSeq, err });
       }
     };
 
@@ -302,17 +375,35 @@ export default function RealtimeOhlcvChart({
         if (!result) {
           return; // duplicate / late / out-of-order — dropped by the aggregator
         }
-        console.log('[candle] live tick', {
+        console.log('[candle] realtime tick ingested', {
+          source: 'realtime-ws',
           interval,
-          ts: new Date(event.tsMs).toISOString(),
-          close: event.close,
-          volume: event.volume,
+          wsRow: row,
+          event: {
+            id: event.id,
+            ts: new Date(event.tsMs).toISOString(),
+            o: event.open,
+            h: event.high,
+            l: event.low,
+            c: event.close,
+            v: event.volume,
+          },
+          aggregatorLive: result.live ? formatCandleRowForLog(result.live) : null,
         });
         // Boundary crossed: the selected-interval bucket rolled. The just-closed
         // bucket keeps its last-composed value (frozen on the chart); refetch the
         // finer blocks for the new bucket and recompose from scratch.
         const eventBucket = bucketStartMs(event.tsMs, bucketMs);
         if (eventBucket !== formingBucketStartRef.current) {
+          console.log('[candle] bucket roll → will refetchFiner', {
+            source: 'realtime-ws',
+            interval,
+            prevBucket:
+              formingBucketStartRef.current != null
+                ? new Date(formingBucketStartRef.current).toISOString()
+                : null,
+            newBucket: new Date(eventBucket).toISOString(),
+          });
           void refetchFiner('bucket-roll');
         } else {
           scheduleFlush();

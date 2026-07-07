@@ -432,6 +432,7 @@ class KalshiLiveWorker {
     const latestByMarket = new Map();
     const tickRows = [];
 
+    
     for (const state of this.tickerStates.values()) {
       if (!state.pendingSnapshot) continue;
       const snap = state.pendingSnapshot;

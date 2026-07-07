@@ -13,23 +13,47 @@ const { upsertBatched } = require('../../lib/bulk-upsert');
 const { createGuardedInterval } = require('../../lib/guarded-interval');
 const { getHotMarkets } = require('../../lib/tiers');
 const { normalizePrice } = require('../../lib/price-units');
+
 const {
-  getFetchWindow,
+  STORED_INTERVALS,
+  getFirstBackfillWindow,
+  getLastClosedBucketWindowSec,
+  isIntervalDue,
   toCandleRows,
   maxCandleTs,
   mergeLastCandleTs,
   chunkArray,
   splitTimeWindowsForCandles,
 } = require('../../lib/history-common');
-const { aggregateToInterval } = require('../../lib/ohlc');
+const { aggregateToInterval, getBucketMs } = require('../../lib/ohlc');
 
 const WORKER_NAME = 'kalshi/history';
 
-const KALSHI_PERIOD_MINUTES = {
-  '1m': 1,
-  '1h': 60,
-  '1d': 1440,
+/**
+ * Per-interval fetch pipeline. Kalshi REST only exposes 1m / 1h / 1d candles;
+ * finer intervals are aggregated transiently and never stored as 1m.
+ *
+ * Incremental: only the last closed bucket window is requested.
+ * First backfill: full lookback per interval (see LOOKBACK_SECONDS).
+ */
+const INTERVAL_PIPELINE = {
+  '5m': { kalshiPeriodMinutes: 1, aggregateFrom: '1m' },
+  '15m': { kalshiPeriodMinutes: 1, aggregateFrom: '1m' },
+  '1h': { kalshiPeriodMinutes: 60, aggregateFrom: null },
+  '4h': { kalshiPeriodMinutes: 60, aggregateFrom: '1h' },
+  '1d': { kalshiPeriodMinutes: 1440, aggregateFrom: null },
+  '1w': { kalshiPeriodMinutes: 1440, aggregateFrom: '1d' },
 };
+
+/** Kalshi native candles use end-of-period ts; we store bucket-start to match rollups. */
+function normalizeCandleTsToBucketStart(candles, interval) {
+  const bucketMs = getBucketMs(interval);
+  return candles.map((c) => {
+    const tsMs = Date.parse(c.ts);
+    const bucketStart = Math.floor((tsMs - 1) / bucketMs) * bucketMs;
+    return { ...c, ts: new Date(bucketStart).toISOString() };
+  });
+}
 
 function validateEnv() {
   if (!process.env.SUPABASE_URL?.trim()) {
@@ -163,6 +187,46 @@ async function fetchCandlesForTickers(tickers, startTs, endTs, periodInterval) {
   return results;
 }
 
+/**
+ * Fetch Kalshi candles for one stored interval and return rows ready to persist.
+ * On incremental polls only the last closed bucket is returned.
+ */
+async function fetchStoredIntervalCandles(ticker, interval, isFirstBackfill) {
+  const pipeline = INTERVAL_PIPELINE[interval];
+  if (!pipeline) {
+    throw new Error(`[${WORKER_NAME}] unknown interval pipeline: ${interval}`);
+  }
+
+  const window = isFirstBackfill
+    ? getFirstBackfillWindow(interval)
+    : getLastClosedBucketWindowSec(interval);
+
+  const byTicker = await fetchCandlesForTickers(
+    [ticker],
+    window.startTs,
+    window.endTs,
+    pipeline.kalshiPeriodMinutes
+  );
+  const raw = byTicker.get(ticker) ?? [];
+
+  if (!raw.length) {
+    return [];
+  }
+
+  let candles;
+  if (!pipeline.aggregateFrom) {
+    candles = raw;
+  } else {
+    candles = aggregateToInterval(raw, pipeline.aggregateFrom, interval);
+  }
+
+  if (!isFirstBackfill) {
+    candles = candles.slice(-1);
+  }
+
+  return normalizeCandleTsToBucketStart(candles, interval);
+}
+
 async function persistCandlesAndState(marketId, candleRowsByInterval, existingState) {
   let written = 0;
 
@@ -202,96 +266,50 @@ async function persistCandlesAndState(marketId, candleRowsByInterval, existingSt
   return written;
 }
 
-async function backfillMarketGroup(markets, stateByMarket) {
-  const tickers = markets.map((m) => m.external_id);
-  const isFirstBackfill = markets.some((m) => !stateByMarket.get(m.id)?.last_backfill_at);
+async function syncMarket(market, ingestionState) {
+  const isFirstBackfill = !ingestionState?.last_backfill_at;
+  const lastCandleTs = ingestionState?.last_candle_ts ?? {};
+  const nowSec = Math.floor(Date.now() / 1000);
+  const candleRowsByInterval = {};
+  const fetched = [];
 
-  const window1m = getFetchWindow(isFirstBackfill, '1m');
-  const candles1mByTicker = await fetchCandlesForTickers(
-    tickers,
-    window1m.startTs,
-    window1m.endTs,
-    KALSHI_PERIOD_MINUTES['1m']
-  );
-
-  let rowsWritten = 0;
-
-  for (const market of markets) {
-    const ingestionState = stateByMarket.get(market.id);
-    const marketFirst = !ingestionState?.last_backfill_at;
-    const candles1m = candles1mByTicker.get(market.external_id) ?? [];
-    const candleRowsByInterval = {
-      '1m': toCandleRows(market.id, '1m', candles1m),
-    };
-
-    // Source candle arrays (pre-row shape) per interval, so the coarser
-    // intervals (15m/4h/1w) can be rolled up from the nearest finer source.
-    let candles5m = [];
-    let candles1h = [];
-    let candles1d = [];
-
-    if (candles1m.length > 0) {
-      candles5m = aggregateToInterval(candles1m, '1m', '5m');
-      candleRowsByInterval['5m'] = toCandleRows(market.id, '5m', candles5m);
-      candleRowsByInterval['15m'] = toCandleRows(
-        market.id,
-        '15m',
-        aggregateToInterval(candles1m, '1m', '15m')
-      );
+  for (const interval of STORED_INTERVALS) {
+    if (!isFirstBackfill && !isIntervalDue(interval, lastCandleTs[interval], nowSec)) {
+      continue;
     }
 
-    if (marketFirst) {
-      const window1h = getFetchWindow(true, '1h');
-      const candles1hMap = await fetchCandlesForTickers(
-        [market.external_id],
-        window1h.startTs,
-        window1h.endTs,
-        KALSHI_PERIOD_MINUTES['1h']
-      );
-      candles1h = candles1hMap.get(market.external_id) ?? [];
-      candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', candles1h);
+    const window = isFirstBackfill
+      ? getFirstBackfillWindow(interval)
+      : getLastClosedBucketWindowSec(interval, nowSec);
 
-      const window1d = getFetchWindow(true, '1d');
-      const candles1dMap = await fetchCandlesForTickers(
-        [market.external_id],
-        window1d.startTs,
-        window1d.endTs,
-        KALSHI_PERIOD_MINUTES['1d']
-      );
-      candles1d = candles1dMap.get(market.external_id) ?? [];
-      candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', candles1d);
-    } else if (candles1m.length > 0) {
-      candles1h = aggregateToInterval(candles1m, '1m', '1h');
-      candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', candles1h);
-      candles1d = aggregateToInterval(candles1m, '1m', '1d');
-      candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', candles1d);
+    const candles = await fetchStoredIntervalCandles(
+      market.external_id,
+      interval,
+      isFirstBackfill
+    );
+
+    if (candles.length) {
+      candleRowsByInterval[interval] = toCandleRows(market.id, interval, candles);
+      fetched.push({
+        interval,
+        mode: isFirstBackfill ? 'backfill' : 'incremental',
+        window,
+        rows: candles.length,
+        lastTs: candles[candles.length - 1]?.ts ?? null,
+      });
     }
 
-    // 4h rolls up from 1h, 1w from 1d — whichever source (fetched or derived)
-    // we ended up with above.
-    if (candles1h.length > 0) {
-      candleRowsByInterval['4h'] = toCandleRows(
-        market.id,
-        '4h',
-        aggregateToInterval(candles1h, '1h', '4h')
-      );
-    }
-    if (candles1d.length > 0) {
-      candleRowsByInterval['1w'] = toCandleRows(
-        market.id,
-        '1w',
-        aggregateToInterval(candles1d, '1d', '1w')
-      );
-    }
+    await sleep(REQUEST_DELAY_MS);
+  }
 
-    rowsWritten += await persistCandlesAndState(
-      market.id,
-      candleRowsByInterval,
-      ingestionState
+  if (fetched.length) {
+    console.log(
+      `[${WORKER_NAME}] market=${market.id} ticker=${market.external_id}`,
+      JSON.stringify(fetched)
     );
   }
 
-  return rowsWritten;
+  return persistCandlesAndState(market.id, candleRowsByInterval, ingestionState);
 }
 
 async function poll() {
@@ -304,11 +322,11 @@ async function poll() {
   const stateByMarket = await loadIngestionState(hotMarkets.map((m) => m.id));
   let rowsWritten = 0;
 
-  for (const batch of chunkArray(hotMarkets, 1)) {
+  for (const market of hotMarkets) {
     try {
-      rowsWritten += await backfillMarketGroup(batch, stateByMarket);
+      rowsWritten += await syncMarket(market, stateByMarket.get(market.id));
     } catch (err) {
-      console.error(`[${WORKER_NAME}] batch backfill: ${err.message}`);
+      console.error(`[${WORKER_NAME}] sync market=${market.id}: ${err.message}`);
     }
   }
 
@@ -325,7 +343,11 @@ function start() {
     HISTORY_POLL_MS
   );
 
-  console.log(`[${WORKER_NAME}] starting — poll every ${HISTORY_POLL_MS / 60_000}m (hot only)`);
+  console.log(
+    `[${WORKER_NAME}] starting — tick every ${HISTORY_POLL_MS / 1000}s; ` +
+      `intervals=${STORED_INTERVALS.join(',')} (no 1m stored); ` +
+      `incremental=last closed bucket only`
+  );
   return startInterval();
 }
 
@@ -336,6 +358,10 @@ if (require.main === module) {
 module.exports = {
   start,
   poll,
+  syncMarket,
+  fetchStoredIntervalCandles,
   mapKalshiCandlestick,
   probFromDollars,
+  INTERVAL_PIPELINE,
+  STORED_INTERVALS,
 };
