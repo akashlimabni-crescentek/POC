@@ -289,27 +289,27 @@ export default function RealtimeOhlcvChart({
           interval,
           bucketStart: new Date(bucket).toISOString(),
         });
-        // logCandleRowsByInterval('[candle] refetchFiner — history-table rows', rows, {
-        //   source: 'history-table',
-        //   reason,
-        //   callSeq,
-        // });
+        logCandleRowsByInterval('[candle] refetchFiner — history-table rows', rows, {
+          source: 'history-table',
+          reason,
+          callSeq,
+        });
         if (liveTail) {
-          // console.log('[candle] refetchFiner — realtime live tail', {
-          //   source: 'realtime-ws',
-          //   reason,
-          //   callSeq,
-          //   row: formatCandleRowForLog(liveTail),
-          // });
-          // console.table([formatCandleRowForLog(liveTail)]);
+          console.log('[candle] refetchFiner — realtime live tail', {
+            source: 'realtime-ws',
+            reason,
+            callSeq,
+            row: formatCandleRowForLog(liveTail),
+          });
+          console.table([formatCandleRowForLog(liveTail)]);
         } else {
-          // console.log('[candle] refetchFiner — realtime live tail', {
-          //   source: 'realtime-ws',
-          //   reason,
-          //   callSeq,
-          //   row: null,
-          //   note: 'No websocket ticks ingested yet for this bucket',
-          // });
+          console.log('[candle] refetchFiner — realtime live tail', {
+            source: 'realtime-ws',
+            reason,
+            callSeq,
+            row: null,
+            note: 'No websocket ticks ingested yet for this bucket',
+          });
         }
         paintForming(true);
       } catch (err) {

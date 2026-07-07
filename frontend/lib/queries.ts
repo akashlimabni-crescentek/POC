@@ -240,16 +240,16 @@ export async function getFinerCandlesForBucket(
     (byInterval[row.interval] ??= []).push(row);
   }
 
-  // logCandleRowsByInterval('[candle] getFinerCandlesForBucket ← DB result', byInterval, {
-  //   source: 'history-table',
-  //   fn: 'getFinerCandlesForBucket',
-  //   reason: meta?.reason ?? 'unknown',
-  //   callSeq: meta?.callSeq ?? null,
-  //   market_id: marketId,
-  //   bucketFrom: bucketStartIso,
-  //   bucketTo: toIso,
-  //   totalRows: (data ?? []).length,
-  // });
+  logCandleRowsByInterval('[candle] getFinerCandlesForBucket ← DB result', byInterval, {
+    source: 'history-table',
+    fn: 'getFinerCandlesForBucket',
+    reason: meta?.reason ?? 'unknown',
+    callSeq: meta?.callSeq ?? null,
+    market_id: marketId,
+    bucketFrom: bucketStartIso,
+    bucketTo: toIso,
+    totalRows: (data ?? []).length,
+  });
 
   return byInterval;
 }
