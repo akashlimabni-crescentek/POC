@@ -27,6 +27,7 @@ const {
 
 const WORKER_NAME = 'polymarket/history';
 const INTERVAL_1M_MS = getBucketMs('1m');
+const DATA_API_TRADES_MAX_OFFSET = 3000;
 
 function validateEnv() {
   if (!process.env.SUPABASE_URL?.trim()) {
@@ -52,6 +53,21 @@ function parseTradeTimestampMs(trade) {
   }
   const ms = Date.parse(raw);
   return Number.isNaN(ms) ? null : ms;
+}
+
+function tradeInWindow(trade, tokenId, startMs, endMs) {
+  const raw = trade.asset ?? trade.asset_id;
+  const assetId = raw != null ? String(raw) : null;
+  if (assetId && assetId !== String(tokenId)) {
+    return false;
+  }
+
+  const tsMs = parseTradeTimestampMs(trade);
+  if (tsMs == null) {
+    return false;
+  }
+
+  return tsMs >= startMs && tsMs <= endMs;
 }
 
 /** Build 1m OHLC from Data API trades — prices are 0–1 probability */
@@ -95,16 +111,20 @@ function clobPointsToCandles(points) {
     }));
 }
 
-async function fetchTrades(tokenId, startSec, endSec) {
+async function fetchTrades(conditionId, tokenId, startSec, endSec) {
+  if (!conditionId) {
+    return [];
+  }
+
   const trades = [];
   let offset = 0;
   const limit = 500;
   const startMs = startSec * 1000;
   const endMs = endSec * 1000;
 
-  while (true) {
+  while (offset <= DATA_API_TRADES_MAX_OFFSET) {
     const url = new URL(`${POLYMARKET.dataApiBase}/trades`);
-    url.searchParams.set('asset_id', tokenId);
+    url.searchParams.set('market', conditionId);
     url.searchParams.set('limit', String(limit));
     url.searchParams.set('offset', String(offset));
 
@@ -121,13 +141,12 @@ async function fetchTrades(tokenId, startSec, endSec) {
     let reachedPastWindow = false;
     for (const trade of page) {
       const tsMs = parseTradeTimestampMs(trade);
-      if (tsMs == null) continue;
-      if (tsMs < startMs) {
+      if (tsMs != null && tsMs < startMs) {
         reachedPastWindow = true;
-        continue;
       }
-      if (tsMs > endMs) continue;
-      trades.push(trade);
+      if (tradeInWindow(trade, tokenId, startMs, endMs)) {
+        trades.push(trade);
+      }
     }
 
     if (page.length < limit || reachedPastWindow) {
@@ -135,6 +154,12 @@ async function fetchTrades(tokenId, startSec, endSec) {
     }
     offset += limit;
     await sleep(REQUEST_DELAY_MS);
+  }
+
+  if (offset > DATA_API_TRADES_MAX_OFFSET) {
+    console.warn(
+      `[${WORKER_NAME}] trades pagination capped at offset ${DATA_API_TRADES_MAX_OFFSET} for market=${conditionId}`
+    );
   }
 
   return trades;
@@ -222,11 +247,12 @@ async function backfillMarket(market, ingestionState) {
     return 0;
   }
 
+  const conditionId = market.condition_id ? String(market.condition_id) : null;
   const isFirstBackfill = !ingestionState?.last_backfill_at;
   const candleRowsByInterval = {};
 
   const window1m = getFetchWindow(isFirstBackfill, '1m');
-  const trades = await fetchTrades(tokenId, window1m.startTs, window1m.endTs);
+  const trades = await fetchTrades(conditionId, tokenId, window1m.startTs, window1m.endTs);
   const candles1m = tradesTo1mCandles(trades);
 
   if (candles1m.length === 0 && isFirstBackfill) {
@@ -248,8 +274,6 @@ async function backfillMarket(market, ingestionState) {
     trade_count: row.trade_count,
   }));
 
-  // Source candle arrays (aggregate shape) so 15m/4h/1w can be rolled up from
-  // the nearest finer source, whichever way 1h/1d were obtained.
   let source1h = [];
   let source1d = [];
 
@@ -264,32 +288,13 @@ async function backfillMarket(market, ingestionState) {
       '15m',
       aggregateToInterval(source1m, '1m', '15m')
     );
-  }
-
-  if (isFirstBackfill) {
-    const window1h = getFetchWindow(true, '1h');
-    const points1h = await fetchClobHistory(tokenId, window1h.startTs, window1h.endTs, {
-      interval: '1h',
-      fidelity: 60,
-    });
-    source1h = clobPointsToCandles(points1h);
-    candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', source1h);
-
-    const window1d = getFetchWindow(true, '1d');
-    const points1d = await fetchClobHistory(tokenId, window1d.startTs, window1d.endTs, {
-      interval: '1d',
-      fidelity: 1440,
-    });
-    source1d = clobPointsToCandles(points1d);
-    candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', source1d);
-  } else if (source1m.length > 0) {
+    // Roll up from stored 1m — CLOB /prices-history 1h/1d with 90d+ windows often 400s.
     source1h = aggregateToInterval(source1m, '1m', '1h');
     candleRowsByInterval['1h'] = toCandleRows(market.id, '1h', source1h);
     source1d = aggregateToInterval(source1m, '1m', '1d');
     candleRowsByInterval['1d'] = toCandleRows(market.id, '1d', source1d);
   }
 
-  // 4h rolls up from 1h, 1w from 1d.
   if (source1h.length > 0) {
     candleRowsByInterval['4h'] = toCandleRows(
       market.id,

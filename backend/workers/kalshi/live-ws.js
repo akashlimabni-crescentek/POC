@@ -28,9 +28,11 @@ const {
   applyTrade,
   shouldEvict,
   normalizeEpochMs,
+  advanceThroughBuckets,
 } = require('../../lib/ohlc');
 
 const WORKER_NAME = 'kalshi/live-ws';
+const USE_STATIC_TEST_PRICES = process.env.KALSHI_STATIC_TEST_PRICES === '1';
 const INTERVAL_1M_MS = getBucketMs('1m');
 const SUBSCRIBE_CHANNELS = ['ticker', 'trade'];
 const TICKER_CHUNK_SIZE = 100;
@@ -61,6 +63,19 @@ function midPrice(bid, ask, last) {
   if (bid != null && ask != null) return (bid + ask) / 2;
   if (last != null) return last;
   return bid ?? ask ?? null;
+}
+
+function randomInRange(min, max, decimals = 2) {
+  return Number((Math.random() * (max - min) + min).toFixed(decimals));
+}
+
+/** Wide static spread for candle/chart verification (remove when done testing). */
+function testStaticPrices() {
+  const bid = randomInRange(0.1, 0.9);
+  const ask = randomInRange(0.15, 0.95);
+  const last = randomInRange(0.05, 0.95);
+  const mid = randomInRange(0.1, 0.9);
+  return { bid, ask, last, mid };
 }
 
 function buildTickerToMarketMap(markets) {
@@ -101,10 +116,32 @@ function createTickerState(marketId) {
   };
 }
 
+function queueClosedCandles(state, closedRows) {
+  if (closedRows.length === 0) return;
+  if (!state.pendingCandleRows) state.pendingCandleRows = [];
+  for (const row of closedRows) {
+    state.pendingCandleRows.push({
+      market_id: state.marketId,
+      interval: '1m',
+      ...row,
+    });
+  }
+}
+
 function ensureBucket(state, price, nowMs = Date.now()) {
   const bucketStart = floorToBucket(nowMs, INTERVAL_1M_MS);
   const p = price ?? state.lastKnownClose;
   if (p == null) return;
+
+  if (state.bucket && state.bucketStartMs != null && bucketStart > state.bucketStartMs) {
+    queueClosedCandles(
+      state,
+      advanceThroughBuckets(state, bucketStart, INTERVAL_1M_MS, {
+        requireActivity: true,
+        maxBuckets: MAX_BUCKETS_PER_FLUSH,
+      })
+    );
+  }
 
   if (!state.bucket || state.bucketStartMs !== bucketStart) {
     state.bucket = createBucket(bucketStart, p);
@@ -113,7 +150,10 @@ function ensureBucket(state, price, nowMs = Date.now()) {
   }
 }
 
-function updateSnapshot(state, { bid, ask, last, ts }) {
+function updateSnapshot(state, { bid, ask, last, ts, skipStaticOverride = false }) {
+  if (USE_STATIC_TEST_PRICES && !skipStaticOverride) {
+    ({ bid, ask, last } = testStaticPrices());
+  }
   const mid = midPrice(bid, ask, last);
   const price = mid ?? last ?? bid ?? ask;
   if (price == null) return;
@@ -143,42 +183,23 @@ function collectCompletedCandles(tickerStates, nowMs = Date.now()) {
   const rows = [];
 
   for (const state of tickerStates.values()) {
-    if (!state.bucket || state.bucketStartMs == null) continue;
-
-    let iterations = 0;
-    while (
-      state.bucketStartMs + INTERVAL_1M_MS <= nowMs &&
-      iterations < MAX_BUCKETS_PER_FLUSH
-    ) {
-      iterations += 1;
-
-      if (state.bucketHadActivity) {
-        rows.push({
-          market_id: state.marketId,
-          interval: '1m',
-          ts: state.bucket.ts,
-          open: state.bucket.open,
-          high: state.bucket.high,
-          low: state.bucket.low,
-          close: state.bucket.close,
-          volume: state.bucket.volume,
-          trade_count: state.bucket.trade_count,
-        });
-      }
-
-      state.lastWrittenBucketMs = state.bucketStartMs;
-      state.bucketHadActivity = false;
-      const nextStart = state.bucketStartMs + INTERVAL_1M_MS;
-      const carry = state.bucket.close;
-      state.lastKnownClose = carry;
-      state.bucket = createBucket(nextStart, carry);
-      state.bucketStartMs = nextStart;
+    if (state.pendingCandleRows?.length) {
+      rows.push(...state.pendingCandleRows);
+      state.pendingCandleRows = [];
     }
 
-    if (iterations >= MAX_BUCKETS_PER_FLUSH) {
-      console.warn(
-        `[${WORKER_NAME}] candle catch-up capped for market=${state.marketId} (${MAX_BUCKETS_PER_FLUSH} buckets)`
-      );
+    if (!state.bucket || state.bucketStartMs == null) continue;
+
+    const closed = advanceThroughBuckets(state, nowMs, INTERVAL_1M_MS, {
+      requireActivity: true,
+      maxBuckets: MAX_BUCKETS_PER_FLUSH,
+    });
+    for (const row of closed) {
+      rows.push({
+        market_id: state.marketId,
+        interval: '1m',
+        ...row,
+      });
     }
   }
 
@@ -195,6 +216,10 @@ function evictIdleTickerState(tickerStates, subscribedTickers) {
     }
   }
   return evicted;
+}
+
+function needsFullKalshiSubscribe(isInitial, channelSidsSize) {
+  return isInitial || channelSidsSize === 0;
 }
 
 function checkSequenceGap(lastSeqBySid, sid, seq) {
@@ -298,8 +323,13 @@ class KalshiLiveWorker {
     }
 
     if (this.ws?.readyState === WebSocket.OPEN) {
-      if (isInitial) {
-        this.subscribeTickers([...nextTickers]);
+      // Full subscribe when connecting or when we have no channel sids yet (e.g. worker
+      // connected before any hot markets existed — update_subscription requires sids).
+      const needsFullSubscribe = needsFullKalshiSubscribe(isInitial, this.channelSids.size);
+      if (needsFullSubscribe) {
+        if (nextTickers.size > 0) {
+          this.subscribeTickers([...nextTickers]);
+        }
       } else {
         this.updateSubscription('add_markets', toSubscribe);
         this.updateSubscription('delete_markets', toUnsubscribe);
@@ -355,6 +385,27 @@ class KalshiLiveWorker {
     const ts = normalizeEpochMs(payload.ts);
 
     if (price == null) return;
+
+    if (USE_STATIC_TEST_PRICES) {
+      const staticPrices = testStaticPrices();
+      const testPrice = staticPrices.last;
+
+      console.log(`[${WORKER_NAME}] socket received (trade)`, {
+        market_ticker: ticker,
+        market_id: state.marketId,
+        last_price: testPrice,
+        size,
+        ts: new Date(ts).toISOString(),
+      });
+
+      state.lastRealTickAt = ts;
+      state.lastKnownClose = testPrice;
+      state.lastPrice = testPrice;
+      ensureBucket(state, testPrice, ts);
+      applyTrade(state.bucket, testPrice, size);
+      updateSnapshot(state, { ...staticPrices, ts, skipStaticOverride: true });
+      return;
+    }
 
     console.log(`[${WORKER_NAME}] socket received (trade)`, {
       market_ticker: ticker,
@@ -424,15 +475,10 @@ class KalshiLiveWorker {
     }
   }
 
-  randomInRange(min, max, decimals = 2){
-    return Number((Math.random() * (max - min) + min).toFixed(decimals));
-  }
-
   async flushLive() {
     const latestByMarket = new Map();
     const tickRows = [];
 
-    
     for (const state of this.tickerStates.values()) {
       if (!state.pendingSnapshot) continue;
       const snap = state.pendingSnapshot;
@@ -443,18 +489,27 @@ class KalshiLiveWorker {
 
     if (tickRows.length === 0) return 0;
 
-    const latestRows = [...latestByMarket.values()].map((snap) => ({
-      market_id: snap.market_id,
-      bid: this.randomInRange(0.1, 0.5),
-      // bid: snap.bid,
-      ask: this.randomInRange(0.2, 0.3),
-      // ask: snap.ask,
-      mid: this.randomInRange(0.12, 0.13),
-      // mid: snap.mid,
-      last_price: this.randomInRange(0.65, 0.99),
-      // last_price: snap.last_price,
-      updated_at: snap.ts,
-    }));
+    const latestRows = [...latestByMarket.values()].map((snap) => {
+      if (USE_STATIC_TEST_PRICES) {
+        const { bid, ask, mid, last } = testStaticPrices();
+        return {
+          market_id: snap.market_id,
+          bid,
+          ask,
+          mid,
+          last_price: last,
+          updated_at: snap.ts,
+        };
+      }
+      return {
+        market_id: snap.market_id,
+        bid: snap.bid,
+        ask: snap.ask,
+        mid: snap.mid,
+        last_price: snap.last_price,
+        updated_at: snap.ts,
+      };
+    });
 
     console.log(`[${WORKER_NAME}] pushing to Supabase (triggers Realtime)`, {
       live_ticks: tickRows,
@@ -636,6 +691,7 @@ module.exports = {
   extractKalshiPrices,
   buildTickerToMarketMap,
   diffTickerSets,
+  needsFullKalshiSubscribe,
   checkSequenceGap,
   collectCompletedCandles,
   updateSnapshot,

@@ -151,6 +151,50 @@ function computeGapFills(lastWrittenBucketTs, currentBucketTs, lastKnownClose, i
   return { fills, capExceeded: false };
 }
 
+/**
+ * Close in-memory buckets through upToMs (exclusive of the open bucket at upToMs).
+ * Mutates state.bucket / bucketStartMs. When requireActivity is true, quiet buckets
+ * are advanced but not returned (Kalshi ticker stream).
+ */
+function advanceThroughBuckets(state, upToMs, intervalMs, options = {}) {
+  const { requireActivity = false, maxBuckets = GAP_FILL_CAP } = options;
+  const rows = [];
+  let iterations = 0;
+
+  while (
+    state.bucket &&
+    state.bucketStartMs != null &&
+    state.bucketStartMs + intervalMs <= upToMs &&
+    iterations < maxBuckets
+  ) {
+    iterations += 1;
+
+    if (!requireActivity || state.bucketHadActivity) {
+      rows.push({
+        ts: state.bucket.ts,
+        open: state.bucket.open,
+        high: state.bucket.high,
+        low: state.bucket.low,
+        close: state.bucket.close,
+        volume: state.bucket.volume,
+        trade_count: state.bucket.trade_count,
+      });
+    }
+
+    state.lastWrittenBucketMs = state.bucketStartMs;
+    if ('bucketHadActivity' in state) {
+      state.bucketHadActivity = false;
+    }
+    const nextStart = state.bucketStartMs + intervalMs;
+    const carry = state.bucket.close;
+    state.lastKnownClose = carry;
+    state.bucket = createBucket(nextStart, carry);
+    state.bucketStartMs = nextStart;
+  }
+
+  return rows;
+}
+
 /** True when per-token state should be evicted (24h idle). */
 function shouldEvict(lastRealTickAt, now = Date.now()) {
   if (!lastRealTickAt) {
@@ -232,6 +276,7 @@ module.exports = {
   applyQuote,
   applyTrade,
   computeGapFills,
+  advanceThroughBuckets,
   shouldEvict,
   aggregateCandles,
   aggregateToInterval,

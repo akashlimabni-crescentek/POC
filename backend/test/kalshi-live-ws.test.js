@@ -6,6 +6,7 @@ const {
   extractKalshiPrices,
   buildTickerToMarketMap,
   diffTickerSets,
+  needsFullKalshiSubscribe,
   checkSequenceGap,
   collectCompletedCandles,
   createTickerState,
@@ -45,6 +46,12 @@ describe('kalshi/live-ws', () => {
       toSubscribe: ['C'],
       toUnsubscribe: ['A'],
     });
+  });
+
+  it('needsFullKalshiSubscribe when no channel sids yet', () => {
+    expect(needsFullKalshiSubscribe(false, 0)).toBe(true);
+    expect(needsFullKalshiSubscribe(false, 2)).toBe(false);
+    expect(needsFullKalshiSubscribe(true, 0)).toBe(true);
   });
 
   it('checkSequenceGap detects missing sequence numbers', () => {

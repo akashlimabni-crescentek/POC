@@ -11,12 +11,8 @@ export default function EventCard({ event }: { event: EventRow }) {
     <Link href={`/events/${event.id}`} className="card card-link">
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem' }}>
         <div>
-          <div style={{ fontWeight: 600, marginBottom: '0.25rem' }}>
+          <div style={{ fontWeight: 600 }}>
             {event.title ?? `Event #${event.id}`}
-          </div>
-          <div className="muted" style={{ fontSize: '0.875rem' }}>
-            {event.category ? `${event.category} · ` : ''}
-            {event.status ?? 'unknown'}
           </div>
         </div>
         <div className="muted" style={{ fontSize: '0.8rem', textAlign: 'right' }}>

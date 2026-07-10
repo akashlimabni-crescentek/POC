@@ -30,6 +30,73 @@ function validateEnv() {
   }
 }
 
+function parseEventTickersFromEnv() {
+  return (
+    process.env.POLYMARKET_EVENT_TICKERS?.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean) ?? []
+  );
+}
+
+function eventMatchesRef(event, ref) {
+  return (
+    String(event.slug) === ref ||
+    String(event.id) === ref ||
+    String(event.ticker) === ref
+  );
+}
+
+async function fetchEventByRef(ref) {
+  const attempts = [{ slug: ref }];
+  if (/^\d+$/.test(ref)) {
+    attempts.push({ id: ref });
+  }
+
+  for (const params of attempts) {
+    const url = new URL(`${POLYMARKET.gammaApiBase}/events`);
+    url.searchParams.set('active', 'true');
+    url.searchParams.set('closed', 'false');
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
+
+    const response = await fetchWithRetry(url.toString());
+    if (!response.ok) {
+      throw new Error(`[${WORKER_NAME}] Gamma /events ${response.status} (${ref})`);
+    }
+
+    const data = await response.json();
+    const page = Array.isArray(data) ? data : data ? [data] : [];
+    const match = page.find((event) => eventMatchesRef(event, ref));
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+
+async function fetchConfiguredEvents(eventRefs) {
+  const events = [];
+  const seen = new Set();
+
+  for (const ref of eventRefs) {
+    const event = await fetchEventByRef(ref);
+    if (!event) {
+      console.warn(`[${WORKER_NAME}] event not found: ${ref}`);
+      continue;
+    }
+
+    const key = String(event.id);
+    if (!seen.has(key)) {
+      seen.add(key);
+      events.push(event);
+    }
+  }
+
+  return events;
+}
+
 async function getProviderId() {
   if (cachedProviderId) {
     return cachedProviderId;
@@ -67,6 +134,21 @@ function parseTokenIds(market) {
   return [];
 }
 
+function parseConditionId(market) {
+  const raw = market.conditionId ?? market.condition_id;
+  return raw != null ? String(raw) : null;
+}
+
+function eventCategory(event) {
+  const raw = event.category ?? event.tags?.[0];
+  if (raw == null) return null;
+  if (typeof raw === 'object') {
+    const label = raw.label ?? raw.slug;
+    return label != null ? String(label) : null;
+  }
+  return String(raw);
+}
+
 function mapEventStatus(event) {
   if (event.closed) return 'closed';
   if (event.active) return 'active';
@@ -85,7 +167,7 @@ function mapEventRow(event, providerId) {
     external_id: String(event.id),
     title: event.title ?? null,
     slug: event.slug ?? null,
-    category: event.category ?? event.tags?.[0] ?? null,
+    category: eventCategory(event),
     close_time: event.endDate ?? event.end_date_iso ?? null,
     image_url: event.image ?? event.icon ?? null,
     status: mapEventStatus(event),
@@ -94,41 +176,24 @@ function mapEventRow(event, providerId) {
   };
 }
 
+function mapMarketRow(market, eventId, providerId, existingTier) {
+  return {
+    event_id: eventId,
+    provider_id: providerId,
+    external_id: String(market.id),
+    title: market.question ?? market.groupItemTitle ?? null,
+    outcome_label: Array.isArray(market.outcomes) ? market.outcomes.join(' / ') : null,
+    status: mapMarketStatus(market),
+    close_time: market.endDate ?? market.end_date_iso ?? null,
+    token_ids: parseTokenIds(market),
+    condition_id: parseConditionId(market),
+    ingestion_tier: resolveIngestionTier(existingTier),
+  };
+}
+
 function resolveIngestionTier(existingTier) {
   if (existingTier === 'hot') return 'hot';
   return 'warm';
-}
-
-async function fetchActiveEvents() {
-  const all = [];
-  let offset = 0;
-  const limit = POLYMARKET.eventsPageSize;
-
-  while (true) {
-    const url = new URL(`${POLYMARKET.gammaApiBase}/events`);
-    url.searchParams.set('active', 'true');
-    url.searchParams.set('closed', 'false');
-    url.searchParams.set('limit', String(limit));
-    url.searchParams.set('offset', String(offset));
-
-    const response = await fetchWithRetry(url.toString());
-    if (!response.ok) {
-      throw new Error(`[${WORKER_NAME}] Gamma /events ${response.status}`);
-    }
-
-    const page = await response.json();
-    if (!Array.isArray(page) || page.length === 0) {
-      break;
-    }
-
-    all.push(...page);
-    if (page.length < limit) {
-      break;
-    }
-    offset += limit;
-  }
-
-  return all;
 }
 
 function updateWatermark(events) {
@@ -181,6 +246,112 @@ async function upsertWithDeadLetter(table, rows, onConflict, deadLetter) {
   return written;
 }
 
+async function syncEventsPage(providerId, events) {
+  if (!events.length) {
+    return 0;
+  }
+
+  let rowsWritten = 0;
+
+  const eventRows = events.map((event) => mapEventRow(event, providerId));
+  rowsWritten += await upsertWithDeadLetter(
+    'events',
+    eventRows,
+    'provider_id,external_id',
+    eventsDeadLetter
+  );
+
+  const eventExternalIds = eventRows.map((row) => row.external_id);
+  const { data: dbEvents, error: eventsError } = await supabase
+    .from('events')
+    .select('id, external_id')
+    .eq('provider_id', providerId)
+    .in('external_id', eventExternalIds);
+
+  if (eventsError) {
+    throw new Error(`[${WORKER_NAME}] events id lookup: ${eventsError.message}`);
+  }
+
+  const eventIdByExternal = new Map((dbEvents ?? []).map((row) => [row.external_id, row.id]));
+
+  const marketCandidates = [];
+  for (const event of events) {
+    const eventId = eventIdByExternal.get(String(event.id));
+    if (!eventId || !Array.isArray(event.markets)) {
+      continue;
+    }
+
+    for (const market of event.markets) {
+      marketCandidates.push({ market, eventId });
+    }
+  }
+
+  const marketExternalIds = marketCandidates.map(({ market }) => String(market.id));
+  const tierByExternal = await loadExistingMarketTiers(providerId, marketExternalIds);
+
+  const marketRows = marketCandidates.map(({ market, eventId }) =>
+    mapMarketRow(market, eventId, providerId, tierByExternal.get(String(market.id)))
+  );
+
+  rowsWritten += await upsertWithDeadLetter(
+    'markets',
+    marketRows,
+    'provider_id,external_id',
+    marketsDeadLetter
+  );
+
+  return rowsWritten;
+}
+
+/**
+ * Gamma offset pagination is capped at ~2000. Use /events/keyset with after_cursor.
+ */
+async function fetchAndSyncActiveEvents(providerId, eventRefs = parseEventTickersFromEnv()) {
+  if (eventRefs.length > 0) {
+    const events = await fetchConfiguredEvents(eventRefs);
+    updateWatermark(events);
+    const totalWritten = await syncEventsPage(providerId, events);
+    return { totalEvents: events.length, totalWritten };
+  }
+
+  let afterCursor = null;
+  let totalEvents = 0;
+  let totalWritten = 0;
+  const limit = POLYMARKET.eventsPageSize;
+
+  while (true) {
+    const url = new URL(`${POLYMARKET.gammaApiBase}/events/keyset`);
+    url.searchParams.set('active', 'true');
+    url.searchParams.set('closed', 'false');
+    url.searchParams.set('limit', String(limit));
+    if (afterCursor) {
+      url.searchParams.set('after_cursor', afterCursor);
+    }
+
+    const response = await fetchWithRetry(url.toString());
+    if (!response.ok) {
+      throw new Error(`[${WORKER_NAME}] Gamma /events/keyset ${response.status}`);
+    }
+
+    const body = await response.json();
+    const page = Array.isArray(body?.events) ? body.events : [];
+    if (page.length === 0) {
+      break;
+    }
+
+    updateWatermark(page);
+    totalWritten += await syncEventsPage(providerId, page);
+    totalEvents += page.length;
+
+    afterCursor = body.next_cursor ?? null;
+    if (!afterCursor) {
+      break;
+    }
+  }
+
+  return { totalEvents, totalWritten };
+}
+
 async function retryDeadLetters(providerId) {
   let written = 0;
 
@@ -196,7 +367,6 @@ async function retryDeadLetters(providerId) {
 
   const pendingMarkets = marketsDeadLetter.drain();
   if (pendingMarkets.length > 0) {
-    // Re-resolve event_id if missing (rows from dead letter should already have event_id)
     written += await upsertWithDeadLetter(
       'markets',
       pendingMarkets,
@@ -216,70 +386,16 @@ async function retryDeadLetters(providerId) {
 
 async function poll() {
   const providerId = await getProviderId();
+  const eventRefs = parseEventTickersFromEnv();
   let rowsWritten = 0;
 
   rowsWritten += await retryDeadLetters(providerId);
 
-  const events = await fetchActiveEvents();
-  updateWatermark(events);
-
-  const eventRows = events.map((e) => mapEventRow(e, providerId));
-  rowsWritten += await upsertWithDeadLetter(
-    'events',
-    eventRows,
-    'provider_id,external_id',
-    eventsDeadLetter
-  );
-
-  const eventExternalIds = eventRows.map((e) => e.external_id);
-  const { data: dbEvents, error: eventsError } = await supabase
-    .from('events')
-    .select('id, external_id')
-    .eq('provider_id', providerId)
-    .in('external_id', eventExternalIds);
-
-  if (eventsError) {
-    throw new Error(`[${WORKER_NAME}] events id lookup: ${eventsError.message}`);
-  }
-
-  const eventIdByExternal = new Map((dbEvents ?? []).map((e) => [e.external_id, e.id]));
-
-  const marketCandidates = [];
-  for (const event of events) {
-    const eventId = eventIdByExternal.get(String(event.id));
-    if (!eventId || !Array.isArray(event.markets)) {
-      continue;
-    }
-
-    for (const market of event.markets) {
-      marketCandidates.push({ market, eventId });
-    }
-  }
-
-  const marketExternalIds = marketCandidates.map(({ market }) => String(market.id));
-  const tierByExternal = await loadExistingMarketTiers(providerId, marketExternalIds);
-
-  const marketRows = marketCandidates.map(({ market, eventId }) => ({
-    event_id: eventId,
-    provider_id: providerId,
-    external_id: String(market.id),
-    title: market.question ?? market.groupItemTitle ?? null,
-    outcome_label: Array.isArray(market.outcomes) ? market.outcomes.join(' / ') : null,
-    status: mapMarketStatus(market),
-    close_time: market.endDate ?? market.end_date_iso ?? null,
-    token_ids: parseTokenIds(market),
-    ingestion_tier: resolveIngestionTier(tierByExternal.get(String(market.id))),
-  }));
-
-  rowsWritten += await upsertWithDeadLetter(
-    'markets',
-    marketRows,
-    'provider_id,external_id',
-    marketsDeadLetter
-  );
+  const { totalEvents, totalWritten } = await fetchAndSyncActiveEvents(providerId, eventRefs);
+  rowsWritten += totalWritten;
 
   console.log(
-    `[${WORKER_NAME}] cycle: events=${events.length} markets=${marketRows.length} written=${rowsWritten} lastSeenTs=${lastSeenTs ?? 'n/a'}`
+    `[${WORKER_NAME}] cycle: events=${totalEvents} written=${rowsWritten} lastSeenTs=${lastSeenTs ?? 'n/a'}${eventRefs.length ? ` filtered=${eventRefs.join(',')}` : ''}`
   );
 
   return rowsWritten;
@@ -294,7 +410,10 @@ function start() {
     POLYMARKET_EVENTS_POLL_MS
   );
 
-  console.log(`[${WORKER_NAME}] starting — poll every ${POLYMARKET_EVENTS_POLL_MS / 1000}s`);
+  const eventRefs = parseEventTickersFromEnv();
+  console.log(
+    `[${WORKER_NAME}] starting — poll every ${POLYMARKET_EVENTS_POLL_MS / 1000}s${eventRefs.length ? ` (filtered: ${eventRefs.join(', ')})` : ' (all active events)'}`
+  );
   return startInterval();
 }
 

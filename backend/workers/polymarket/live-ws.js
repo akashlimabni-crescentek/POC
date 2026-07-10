@@ -27,10 +27,35 @@ const {
   applyTrade,
   computeGapFills,
   shouldEvict,
+  advanceThroughBuckets,
 } = require('../../lib/ohlc');
 
 const WORKER_NAME = 'polymarket/live-ws';
 const INTERVAL_1M_MS = getBucketMs('1m');
+
+let cachedProviderId = null;
+
+async function getProviderId() {
+  if (cachedProviderId) {
+    return cachedProviderId;
+  }
+
+  const { data, error } = await supabase
+    .from('providers')
+    .select('id')
+    .eq('slug', POLYMARKET.slug)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`[${WORKER_NAME}] provider lookup: ${error.message}`);
+  }
+  if (!data) {
+    throw new Error(`[${WORKER_NAME}] provider "${POLYMARKET.slug}" not found — run seed.sql`);
+  }
+
+  cachedProviderId = data.id;
+  return cachedProviderId;
+}
 
 /** Polymarket prices are 0–1 probability at storage boundary */
 function parseProbPrice(raw) {
@@ -62,6 +87,37 @@ function buildTokenToMarketMap(markets) {
   return map;
 }
 
+/** First clob token per market — same source as polymarket/history getPrimaryTokenId. */
+function buildPrimaryTokenSet(markets) {
+  const primary = new Set();
+  for (const market of markets) {
+    const tokens = Array.isArray(market.token_ids) ? market.token_ids : [];
+    if (tokens.length > 0) {
+      primary.add(String(tokens[0]));
+    }
+  }
+  return primary;
+}
+
+function shouldEmitCandleRows(tokenId, primaryTokens) {
+  if (primaryTokens === undefined) {
+    return true;
+  }
+  if (primaryTokens.size === 0) {
+    return false;
+  }
+  return primaryTokens.has(tokenId);
+}
+
+/** Last row wins — guards against duplicate (market_id, interval, ts) in one upsert batch. */
+function dedupeCandleRows(rows) {
+  const byKey = new Map();
+  for (const row of rows) {
+    byKey.set(`${row.market_id}|${row.interval}|${row.ts}`, row);
+  }
+  return [...byKey.values()];
+}
+
 function chunkArray(items, size) {
   const chunks = [];
   for (let i = 0; i < items.length; i += size) {
@@ -90,10 +146,29 @@ function createTokenState(marketId) {
   };
 }
 
+function queueClosedCandles(state, closedRows) {
+  if (closedRows.length === 0) return;
+  if (!state.pendingCandleRows) state.pendingCandleRows = [];
+  for (const row of closedRows) {
+    state.pendingCandleRows.push({
+      market_id: state.marketId,
+      interval: '1m',
+      ...row,
+    });
+  }
+}
+
 function ensureBucket(state, price, nowMs = Date.now()) {
   const bucketStart = floorToBucket(nowMs, INTERVAL_1M_MS);
   const p = price ?? state.lastKnownClose;
   if (p == null) return;
+
+  if (state.bucket && state.bucketStartMs != null && bucketStart > state.bucketStartMs) {
+    queueClosedCandles(
+      state,
+      advanceThroughBuckets(state, bucketStart, INTERVAL_1M_MS)
+    );
+  }
 
   if (!state.bucket || state.bucketStartMs !== bucketStart) {
     state.bucket = createBucket(bucketStart, p);
@@ -124,38 +199,50 @@ function updateSnapshot(state, { bid, ask, last, ts }) {
   };
 }
 
-function collectCompletedCandles(tokenStates, nowMs = Date.now()) {
+function collectCompletedCandles(tokenStates, nowMs = Date.now(), options = {}) {
+  const primaryTokens = options.primaryTokens;
   const rows = [];
 
-  for (const state of tokenStates.values()) {
+  for (const [tokenId, state] of tokenStates) {
+    if (state.pendingCandleRows?.length) {
+      if (shouldEmitCandleRows(tokenId, primaryTokens)) {
+        rows.push(...state.pendingCandleRows);
+      }
+      state.pendingCandleRows = [];
+    }
+
     if (!state.bucket || state.bucketStartMs == null) continue;
 
+    const emitRows = shouldEmitCandleRows(tokenId, primaryTokens);
+
     while (state.bucketStartMs + INTERVAL_1M_MS <= nowMs) {
-      rows.push({
-        market_id: state.marketId,
-        interval: '1m',
-        ts: state.bucket.ts,
-        open: state.bucket.open,
-        high: state.bucket.high,
-        low: state.bucket.low,
-        close: state.bucket.close,
-        volume: state.bucket.volume,
-        trade_count: state.bucket.trade_count,
-      });
-
-      const { fills } = computeGapFills(
-        state.lastWrittenBucketMs,
-        state.bucketStartMs,
-        state.lastKnownClose,
-        INTERVAL_1M_MS
-      );
-
-      for (const fill of fills) {
+      if (emitRows) {
         rows.push({
           market_id: state.marketId,
           interval: '1m',
-          ...fill,
+          ts: state.bucket.ts,
+          open: state.bucket.open,
+          high: state.bucket.high,
+          low: state.bucket.low,
+          close: state.bucket.close,
+          volume: state.bucket.volume,
+          trade_count: state.bucket.trade_count,
         });
+
+        const { fills } = computeGapFills(
+          state.lastWrittenBucketMs,
+          state.bucketStartMs,
+          state.lastKnownClose,
+          INTERVAL_1M_MS
+        );
+
+        for (const fill of fills) {
+          rows.push({
+            market_id: state.marketId,
+            interval: '1m',
+            ...fill,
+          });
+        }
       }
 
       state.lastWrittenBucketMs = state.bucketStartMs;
@@ -187,6 +274,7 @@ class PolymarketLiveWorker {
     this.ws = null;
     this.subscribedTokens = new Set();
     this.tokenToMarket = new Map();
+    this.primaryTokens = new Set();
     this.tokenStates = new Map();
     this.pendingNewTokens = new Set();
     this.reconnectAttempts = 0;
@@ -253,6 +341,7 @@ class PolymarketLiveWorker {
     const { toSubscribe, toUnsubscribe } = diffTokenSets(this.subscribedTokens, nextTokens);
 
     this.tokenToMarket = nextMap;
+    this.primaryTokens = buildPrimaryTokenSet(hotMarkets);
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       if (isInitial) {
@@ -351,25 +440,29 @@ class PolymarketLiveWorker {
   }
 
   async handleMarketResolved(msg) {
+    const providerId = await getProviderId();
     const externalId = msg.id != null ? String(msg.id) : null;
     const conditionId = msg.market != null ? String(msg.market) : null;
 
-    const queries = [];
     if (externalId) {
-      queries.push(
-        supabase.from('markets').update({ status: 'closed' }).eq('external_id', externalId)
-      );
-    }
-    if (conditionId) {
-      queries.push(
-        supabase.from('markets').update({ status: 'closed' }).contains('token_ids', [conditionId])
-      );
+      const { error } = await supabase
+        .from('markets')
+        .update({ status: 'closed' })
+        .eq('provider_id', providerId)
+        .eq('external_id', externalId);
+      if (error) {
+        console.error(`[${WORKER_NAME}] market_resolved external_id update: ${error.message}`);
+      }
     }
 
-    for (const query of queries) {
-      const { error } = await query;
+    if (conditionId) {
+      const { error } = await supabase
+        .from('markets')
+        .update({ status: 'closed' })
+        .eq('provider_id', providerId)
+        .eq('condition_id', conditionId);
       if (error) {
-        console.error(`[${WORKER_NAME}] market_resolved update: ${error.message}`);
+        console.error(`[${WORKER_NAME}] market_resolved condition_id update: ${error.message}`);
       }
     }
 
@@ -418,7 +511,9 @@ class PolymarketLiveWorker {
         this.handleNewMarket(msg);
         break;
       case 'market_resolved':
-        this.handleMarketResolved(msg);
+        this.handleMarketResolved(msg).catch((err) => {
+          console.error(`[${WORKER_NAME}] market_resolved: ${err.message}`);
+        });
         break;
       default:
         break;
@@ -439,8 +534,6 @@ class PolymarketLiveWorker {
 
     if (tickRows.length === 0) return 0;
 
-    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
-
     const latestRows = [...latestByMarket.values()].map((snap) => ({
       market_id: snap.market_id,
       bid: snap.bid,
@@ -449,6 +542,8 @@ class PolymarketLiveWorker {
       last_price: snap.last_price,
       updated_at: snap.ts,
     }));
+
+    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
 
     if (latestRows.length > 0) {
       const { error } = await supabase.from('market_prices_latest').upsert(latestRows, {
@@ -463,7 +558,11 @@ class PolymarketLiveWorker {
   }
 
   async flushCandles() {
-    const candleRows = collectCompletedCandles(this.tokenStates);
+    const candleRows = dedupeCandleRows(
+      collectCompletedCandles(this.tokenStates, Date.now(), {
+        primaryTokens: this.primaryTokens,
+      })
+    );
     if (candleRows.length === 0) return 0;
 
     const { written } = await upsertBatched(supabase, 'candles', candleRows, {
@@ -615,6 +714,9 @@ module.exports = {
   parseProbPrice,
   midPrice,
   buildTokenToMarketMap,
+  buildPrimaryTokenSet,
+  shouldEmitCandleRows,
+  dedupeCandleRows,
   diffTokenSets,
   collectCompletedCandles,
   updateSnapshot,

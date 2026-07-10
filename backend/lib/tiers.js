@@ -41,7 +41,7 @@ async function getHotMarkets(supabase, providerSlug) {
   const { data, error } = await supabase
     .from('markets')
     .select(
-      'id, external_id, token_ids, series_ticker, event_ticker, event_id, provider_id, ingestion_tier, status'
+      'id, external_id, token_ids, condition_id, series_ticker, event_ticker, event_id, provider_id, ingestion_tier, status'
     )
     .eq('provider_id', provider.id)
     .eq('ingestion_tier', HOT_TIER)

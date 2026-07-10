@@ -32,6 +32,7 @@ CREATE TABLE markets (
   status TEXT,
   close_time TIMESTAMPTZ,
   token_ids JSONB,
+  condition_id TEXT,
   series_ticker TEXT,
   event_ticker TEXT,
   ingestion_tier TEXT NOT NULL DEFAULT 'cold',
@@ -95,6 +96,7 @@ CREATE INDEX idx_events_updated_at ON events(updated_at DESC);
 CREATE INDEX idx_markets_provider_tier ON markets(provider_id, status, ingestion_tier);
 CREATE INDEX idx_markets_event_id ON markets(event_id);
 CREATE INDEX idx_markets_hot ON markets(ingestion_tier) WHERE ingestion_tier = 'hot';
+CREATE INDEX idx_markets_condition_id ON markets(condition_id) WHERE condition_id IS NOT NULL;
 CREATE INDEX idx_candles_market_interval_ts ON candles(market_id, interval, ts DESC);
 CREATE INDEX idx_live_ticks_market_ts ON live_ticks(market_id, ts DESC);
 CREATE INDEX idx_live_ticks_ts ON live_ticks(ts);

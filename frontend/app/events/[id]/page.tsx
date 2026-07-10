@@ -46,7 +46,6 @@ export default async function EventPage({ params }: EventPageProps) {
         </h1>
         <div className="muted" style={{ fontSize: '0.875rem' }}>
           {providerName}
-          {event.category ? ` · ${event.category}` : ''}
           {event.status ? ` · ${event.status}` : ''}
         </div>
       </div>
