@@ -71,10 +71,10 @@ function randomInRange(min, max, decimals = 2) {
 
 /** Wide static spread for candle/chart verification (remove when done testing). */
 function testStaticPrices() {
-  const bid = randomInRange(0.1, 0.9);
-  const ask = randomInRange(0.15, 0.95);
-  const last = randomInRange(0.05, 0.95);
-  const mid = randomInRange(0.1, 0.9);
+  const bid = randomInRange(0.1, 0.5);
+  const ask = randomInRange(0.2, 0.3);
+  const last = randomInRange(0.65, 0.99);
+  const mid = randomInRange(0.12, 0.13);
   return { bid, ask, last, mid };
 }
 
@@ -531,8 +531,12 @@ class KalshiLiveWorker {
   }
 
   async flushCandles() {
-    const candleRows = collectCompletedCandles(this.tickerStates);
+    let candleRows = collectCompletedCandles(this.tickerStates);
     if (candleRows.length === 0) return 0;
+
+    if (USE_STATIC_TEST_PRICES) {
+      candleRows = candleRows.map(applyStaticCandleOHLC);
+    }
 
     console.log(`[${WORKER_NAME}] pushing to Supabase (candles)`, {
       count: candleRows.length,
