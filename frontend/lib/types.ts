@@ -41,6 +41,7 @@ export type MarketRow = {
   status: string | null;
   close_time: string | null;
   ingestion_tier: string;
+  token_ids?: string[] | null;
   market_prices_latest?: MarketPriceLatest | MarketPriceLatest[] | null;
   events?: { id: number; title: string | null } | { id: number; title: string | null }[] | null;
   providers?: ProviderRef | ProviderRef[] | null;
@@ -69,6 +70,17 @@ export type LiveTickRow = {
   mid: number | null;
   last_price: number | null;
   volume: number | null;
+};
+
+import type { BookLevel } from './orderbook';
+
+export type MarketOrderbookLatest = {
+  market_id: number;
+  yes_bids: BookLevel[];
+  no_bids: BookLevel[];
+  bids: BookLevel[];
+  asks: BookLevel[];
+  updated_at: string | null;
 };
 
 export type MarketIngestionStateRow = {

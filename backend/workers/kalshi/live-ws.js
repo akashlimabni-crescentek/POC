@@ -20,6 +20,12 @@ const { upsertBatched } = require('../../lib/bulk-upsert');
 const { reportCycle, reportError } = require('../../lib/heartbeat');
 const { normalizePrice } = require('../../lib/price-units');
 const {
+  createKalshiBook,
+  setKalshiSnapshot,
+  applyKalshiDelta,
+  rowFromKalshiBook,
+} = require('../../lib/orderbook');
+const {
   getBucketMs,
   floorToBucket,
   createBucket,
@@ -35,6 +41,7 @@ const WORKER_NAME = 'kalshi/live-ws';
 const USE_STATIC_TEST_PRICES = process.env.KALSHI_STATIC_TEST_PRICES === '1';
 const INTERVAL_1M_MS = getBucketMs('1m');
 const SUBSCRIBE_CHANNELS = ['ticker', 'trade'];
+const ORDERBOOK_CHANNEL = 'orderbook_delta';
 const TICKER_CHUNK_SIZE = 100;
 /** Safety cap — max 1m buckets closed per ticker per flush (2h catch-up) */
 const MAX_BUCKETS_PER_FLUSH = 120;
@@ -105,6 +112,7 @@ function chunkArray(items, size) {
 function createTickerState(marketId) {
   return {
     marketId,
+    orderBook: createKalshiBook(),
     bucket: null,
     bucketStartMs: null,
     bucketHadActivity: false,
@@ -287,6 +295,14 @@ class KalshiLiveWorker {
           market_tickers: chunk,
         },
       });
+      this.sendCmd({
+        cmd: 'subscribe',
+        params: {
+          channels: [ORDERBOOK_CHANNEL],
+          market_tickers: chunk,
+          use_yes_price: true,
+        },
+      });
     }
   }
 
@@ -430,6 +446,43 @@ class KalshiLiveWorker {
     });
   }
 
+  handleOrderbookSnapshot(msg) {
+    const payload = msg.msg ?? msg;
+    const ticker = String(payload.market_ticker);
+    const state = this.getOrCreateState(ticker);
+    if (!state) return;
+
+    setKalshiSnapshot(state.orderBook, payload);
+
+    console.log(`[${WORKER_NAME}] orderbook WS snapshot event`, {
+      table: 'market_orderbook_latest',
+      market_ticker: ticker,
+      market_id: state.marketId,
+      yes_bid_levels: state.orderBook.yes_bids.length,
+      no_bid_levels: state.orderBook.no_bids.length,
+    });
+  }
+
+  handleOrderbookDelta(msg) {
+    const payload = msg.msg ?? msg;
+    const ticker = String(payload.market_ticker);
+    const state = this.getOrCreateState(ticker);
+    if (!state) return;
+
+    applyKalshiDelta(state.orderBook, payload);
+
+    console.log(`[${WORKER_NAME}] orderbook WS delta event`, {
+      table: 'market_orderbook_latest',
+      market_ticker: ticker,
+      market_id: state.marketId,
+      side: payload.side,
+      price: payload.price_dollars ?? payload.price,
+      delta: payload.delta_fp ?? payload.delta,
+      yes_bid_levels: state.orderBook.yes_bids.length,
+      no_bid_levels: state.orderBook.no_bids.length,
+    });
+  }
+
   resubscribeOnSequenceGap(sid, seq) {
     const last = this.lastSeqBySid.get(sid);
     console.warn(
@@ -465,6 +518,12 @@ class KalshiLiveWorker {
       case 'trade':
         this.handleTrade(msg);
         break;
+      case 'orderbook_snapshot':
+        this.handleOrderbookSnapshot(msg);
+        break;
+      case 'orderbook_delta':
+        this.handleOrderbookDelta(msg);
+        break;
       case 'error':
         console.error(
           `[${WORKER_NAME}] ws error code=${msg.msg?.code}: ${msg.msg?.msg ?? 'unknown'}`
@@ -478,16 +537,23 @@ class KalshiLiveWorker {
   async flushLive() {
     const latestByMarket = new Map();
     const tickRows = [];
+    const orderbookRows = [];
 
     for (const state of this.tickerStates.values()) {
-      if (!state.pendingSnapshot) continue;
-      const snap = state.pendingSnapshot;
-      latestByMarket.set(snap.market_id, snap);
-      tickRows.push(snap);
-      state.pendingSnapshot = null;
+      if (state.pendingSnapshot) {
+        const snap = state.pendingSnapshot;
+        latestByMarket.set(snap.market_id, snap);
+        tickRows.push(snap);
+        state.pendingSnapshot = null;
+      }
+
+      if (state.orderBook?.dirty) {
+        orderbookRows.push(rowFromKalshiBook(state.marketId, state.orderBook));
+        state.orderBook.dirty = false;
+      }
     }
 
-    if (tickRows.length === 0) return 0;
+    if (tickRows.length === 0 && orderbookRows.length === 0) return 0;
 
     const latestRows = [...latestByMarket.values()].map((snap) => {
       if (USE_STATIC_TEST_PRICES) {
@@ -516,7 +582,10 @@ class KalshiLiveWorker {
       market_prices_latest: latestRows,
     });
 
-    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
+    const { inserted } =
+      tickRows.length > 0
+        ? await insertWithRetry(supabase, 'live_ticks', tickRows)
+        : { inserted: 0 };
 
     if (latestRows.length > 0) {
       const { error } = await supabase.from('market_prices_latest').upsert(latestRows, {
@@ -524,6 +593,25 @@ class KalshiLiveWorker {
       });
       if (error) {
         console.error(`[${WORKER_NAME}] market_prices_latest upsert: ${error.message}`);
+      }
+    }
+
+    if (orderbookRows.length > 0) {
+      const { error } = await supabase.from('market_orderbook_latest').upsert(orderbookRows, {
+        onConflict: 'market_id',
+      });
+      if (error) {
+        console.error(`[${WORKER_NAME}] market_orderbook_latest upsert: ${error.message}`);
+      } else {
+        console.log(`[${WORKER_NAME}] market_orderbook_latest upsert`, {
+          count: orderbookRows.length,
+          markets: orderbookRows.map((row) => ({
+            market_id: row.market_id,
+            yes_bid_levels: row.yes_bids.length,
+            no_bid_levels: row.no_bids.length,
+            updated_at: row.updated_at,
+          })),
+        });
       }
     }
 

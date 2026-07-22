@@ -23,8 +23,8 @@ npm run dev:frontend                          # Next.js on :3000
 |--------|---------|----------|------------|-----------|-------|--------|----------|
 | `polymarket/events.js` | 60s | yes | yes | n/a | Gamma API `/events` | `events`, `markets` | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
 | `kalshi/events.js` | 30m | yes | yes | n/a | Kalshi API `/markets` | `events`, `markets`, `market_ingestion_state` | `SUPABASE_*`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64`, `KALSHI_SERIES_TICKERS` (optional) |
-| `polymarket/live-ws.js` | WS + 1s/60s flush | n/a | yes | **yes** | Polymarket WS market channel | `live_ticks`, `market_prices_latest`, `candles` 1m | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
-| `kalshi/live-ws.js` | WS + 1s/60s flush | n/a | yes | **yes** | Kalshi WS ticker + trade | `live_ticks`, `market_prices_latest`, `candles` 1m | `SUPABASE_*`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` |
+| `polymarket/live-ws.js` | WS + 1s/60s flush | n/a | yes | **yes** | Polymarket WS market channel | `live_ticks`, `market_prices_latest`, `market_orderbook_latest`, `candles` 1m | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
+| `kalshi/live-ws.js` | WS + 1s/60s flush | n/a | yes | **yes** | Kalshi WS ticker + trade + orderbook | `live_ticks`, `market_prices_latest`, `market_orderbook_latest`, `candles` 1m | `SUPABASE_*`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` |
 | `polymarket/history.js` | 15m | yes | yes | **yes** | Data API `/trades`, CLOB `/prices-history` | `candles` all intervals | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
 | `kalshi/history.js` | 15m | yes | yes | **yes** | Kalshi `/markets/candlesticks` | `candles` all intervals | `SUPABASE_*`, `KALSHI_*` |
 | `maintenance/retention.js` | 1h | yes | yes | n/a | `live_ticks`, `candles`, `markets` | DELETE old rows; `demoteStale` | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
@@ -91,7 +91,8 @@ Validation: `npm run validate:env` (root) or `node scripts/validate-env.js --bac
 - **Hot only:** `getHotMarkets(supabase, 'polymarket')` — refresh every 5 min (diff subscribe/unsubscribe)
 - **Chunks:** 250 `token_ids` per subscribe message
 - **Events:** `book`, `best_bid_ask`, `last_trade_price`, `price_change`, `new_market` (queued), `market_resolved` (→ `closed`)
-- **Flush:** 1s → `live_ticks` + `market_prices_latest`; 60s → `candles` 1m with gap-fill (cap 36)
+- **Order book:** `book` events → full bid/ask ladders upserted to `market_orderbook_latest` (Realtime-enabled)
+- **Flush:** 1s → `live_ticks` + `market_prices_latest` + `market_orderbook_latest`; 60s → `candles` 1m with gap-fill (cap 36)
 - **Memory:** per-token OHLC, orderBook, lastKnownClose — evict after 24h idle
 - **Keepalive:** PING every 10s, reconnect on PONG timeout
 - **Prices:** stored as 0–1 probability (Polymarket native)
@@ -100,9 +101,10 @@ Validation: `npm run validate:env` (root) or `node scripts/validate-env.js --bac
 
 - **Endpoint:** `wss://api.elections.kalshi.com/trade-api/ws/v2` (signed handshake)
 - **Hot only:** `getHotMarkets(supabase, 'kalshi')` — refresh every 5 min via `update_subscription`
-- **Channels:** `ticker` + `trade` for hot `market_tickers`
+- **Channels:** `ticker` + `trade` + `orderbook_delta` (`use_yes_price: true`) for hot `market_tickers`
+- **Order book:** `orderbook_snapshot` + `orderbook_delta` → yes/no bid ladders in `market_orderbook_latest`
 - **Sequence gaps:** `seq` per `sid` — reconnect on gap
-- **Flush:** 1s → `live_ticks` + `market_prices_latest`; 60s → `candles` 1m with gap-fill
+- **Flush:** 1s → `live_ticks` + `market_prices_latest` + `market_orderbook_latest`; 60s → `candles` 1m with gap-fill
 - **Prices:** Kalshi cents/dollars → 0–1 via `lib/price-units.js` on write
 - **Memory:** per-ticker OHLC state — evict after 24h idle
 

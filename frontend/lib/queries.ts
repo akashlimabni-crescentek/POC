@@ -6,6 +6,7 @@ import type {
   CandleInterval,
   CandleRow,
   EventRow,
+  MarketOrderbookLatest,
   MarketPriceLatest,
   MarketRow,
   Provider,
@@ -124,7 +125,7 @@ export async function getMarketById(
   const { data, error } = await supabase
     .from('markets')
     .select(
-      'id, event_id, provider_id, external_id, title, outcome_label, status, close_time, ingestion_tier, market_prices_latest(*), events(id, title), providers(slug, name)'
+      'id, event_id, provider_id, external_id, title, outcome_label, status, close_time, ingestion_tier, token_ids, market_prices_latest(*), events(id, title), providers(slug, name)'
     )
     .eq('id', marketId)
     .maybeSingle();
@@ -266,6 +267,23 @@ export async function promoteEventToHot(eventId: number): Promise<void> {
   if (error) {
     throw new Error(`promote_event_to_hot failed: ${error.message}`);
   }
+}
+
+export async function getMarketOrderbook(
+  supabase: SupabaseClient,
+  marketId: number
+): Promise<MarketOrderbookLatest | null> {
+  const { data, error } = await supabase
+    .from('market_orderbook_latest')
+    .select('market_id, yes_bids, no_bids, bids, asks, updated_at')
+    .eq('market_id', marketId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`getMarketOrderbook failed: ${error.message}`);
+  }
+
+  return data;
 }
 
 export function pickLatestPrice(market: {

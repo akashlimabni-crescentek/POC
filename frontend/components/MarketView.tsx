@@ -23,6 +23,8 @@ import { formatProbability } from '@/lib/chart';
 import { formatGmtIso } from '@/lib/datetime';
 import { pickProvider, pickRelation } from '@/lib/utils';
 import OhlcvChart from '@/components/OhlcvChart';
+import OrderBook from '@/components/OrderBook';
+import { primaryTokenId } from '@/lib/orderbook';
 import type { CandleRow, MarketPriceLatest, MarketRow } from '@/lib/types';
 
 const STALE_MS = 30_000;
@@ -108,6 +110,12 @@ export default function MarketView({ market }: { market: MarketRow }) {
     pickProvider(market.providers)?.name ??
     pickProvider(market.providers)?.slug ??
     'Provider';
+  const providerSlug = pickProvider(market.providers)?.slug ?? '';
+  const polyTokenId = providerSlug === 'polymarket' ? primaryTokenId(market.token_ids) : null;
+  const kalshiTicker = providerSlug === 'kalshi' ? market.external_id : null;
+  const yesPrice = price?.bid ?? price?.mid ?? price?.last_price ?? null;
+  const noPrice =
+    price?.ask != null ? 1 - price.ask : yesPrice != null ? 1 - yesPrice : null;
 
   return (
     <div>
@@ -189,6 +197,17 @@ export default function MarketView({ market }: { market: MarketRow }) {
         {!candlesLoading && candles.length > 0 && (
           <OhlcvChart candles={candles} resetKey={candlesResetKey} />
         )}
+      </div>
+
+      <div className="card" style={{ marginTop: '1.25rem' }}>
+        <OrderBook
+          marketId={market.id}
+          providerSlug={providerSlug}
+          kalshiTicker={kalshiTicker}
+          polyTokenId={polyTokenId}
+          yesPrice={yesPrice}
+          noPrice={noPrice}
+        />
       </div>
     </div>
   );

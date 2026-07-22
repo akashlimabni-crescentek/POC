@@ -1,5 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { LiveTickRow, MarketIngestionStateRow, MarketPriceLatest } from './types';
+import type { LiveTickRow, MarketIngestionStateRow, MarketOrderbookLatest, MarketPriceLatest } from './types';
 
 export type RealtimeUnsubscribe = () => void;
 
@@ -82,7 +82,7 @@ function logSubscribeStatus(
 function subscribeTable<T extends { market_id: number }>(
   supabase: SupabaseClient,
   channelName: string,
-  table: 'market_prices_latest' | 'live_ticks' | 'market_ingestion_state',
+  table: 'market_prices_latest' | 'live_ticks' | 'market_ingestion_state' | 'market_orderbook_latest',
   marketId: number,
   onUpdate: PostgresHandler<T>
 ): RealtimeUnsubscribe {
@@ -120,7 +120,7 @@ function subscribeTable<T extends { market_id: number }>(
 function subscribeTableMany<T extends { market_id: number }>(
   supabase: SupabaseClient,
   channelName: string,
-  table: 'market_prices_latest' | 'live_ticks' | 'market_ingestion_state',
+  table: 'market_prices_latest' | 'live_ticks' | 'market_ingestion_state' | 'market_orderbook_latest',
   marketIds: number[],
   onUpdate: PostgresHandler<T>
 ): RealtimeUnsubscribe {
@@ -229,6 +229,49 @@ export function subscribeLiveTicksMany(
   onUpdate: PostgresHandler<LiveTickRow>
 ): RealtimeUnsubscribe {
   return subscribeTableMany(supabase, channelKey, 'live_ticks', marketIds, onUpdate);
+}
+
+/** Subscribe to market_orderbook_latest for a single market. */
+export function subscribeMarketOrderbook(
+  supabase: SupabaseClient,
+  marketId: number,
+  onUpdate: PostgresHandler<MarketOrderbookLatest>
+): RealtimeUnsubscribe {
+  return subscribeTable(
+    supabase,
+    `market-orderbook-${marketId}`,
+    'market_orderbook_latest',
+    marketId,
+    onUpdate
+  );
+}
+
+/** Subscribe to market_orderbook_latest with channel status for reconnect resync. */
+export function subscribeMarketOrderbookWithStatus(
+  supabase: SupabaseClient,
+  marketId: number,
+  onUpdate: PostgresHandler<MarketOrderbookLatest>,
+  onStatus?: (status: string) => void
+): RealtimeUnsubscribe {
+  const channelName = `market-orderbook-live-${marketId}`;
+  const table = 'market_orderbook_latest' as const;
+
+  const channel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table, filter: `market_id=eq.${marketId}` },
+      (payload) => handlePayload(channelName, table, payload, onUpdate)
+    )
+    .subscribe((status, err) => {
+      logSubscribeStatus(table, channelName, [marketId], status, err);
+      onStatus?.(status);
+    });
+
+  return () => {
+    console.log(`${LOG} unsubscribed`, { channel: channelName, table, marketIds: [marketId] });
+    supabase.removeChannel(channel);
+  };
 }
 
 /** Subscribe to market_ingestion_state for a single market. */

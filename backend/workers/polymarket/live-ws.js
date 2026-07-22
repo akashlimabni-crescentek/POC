@@ -20,6 +20,12 @@ const { insertWithRetry } = require('../../lib/db-retry');
 const { upsertBatched } = require('../../lib/bulk-upsert');
 const { reportCycle, reportError } = require('../../lib/heartbeat');
 const {
+  setPolymarketBook,
+  applyPolymarketPriceChange,
+  rowFromPolymarketBook,
+  dedupeOrderbookRowsByMarket,
+} = require('../../lib/orderbook');
+const {
   getBucketMs,
   floorToBucket,
   createBucket,
@@ -325,6 +331,53 @@ class PolymarketLiveWorker {
     }
   }
 
+  async fetchClobBook(tokenId) {
+    const url = `${POLYMARKET.clobApiBase}/book?token_id=${encodeURIComponent(tokenId)}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`CLOB ${res.status}: ${text.slice(0, 200)}`);
+    }
+    return res.json();
+  }
+
+  /** Seed full book from CLOB REST — primary token per hot market. */
+  async seedOrderbooksForTokens(tokenIds) {
+    for (const tokenId of tokenIds) {
+      if (!this.primaryTokens.has(tokenId)) continue;
+
+      const marketId = this.tokenToMarket.get(tokenId);
+      if (!marketId) continue;
+
+      try {
+        const data = await this.fetchClobBook(tokenId);
+        const state = this.getOrCreateState(tokenId);
+        if (!state) continue;
+
+        state.orderBook = {
+          bids: data.bids ?? [],
+          asks: data.asks ?? [],
+        };
+        setPolymarketBook(
+          state,
+          state.orderBook.bids,
+          state.orderBook.asks,
+          new Date().toISOString()
+        );
+
+        console.log(`[${WORKER_NAME}] orderbook seeded from REST`, {
+          table: 'market_orderbook_latest',
+          market_id: marketId,
+          token_id: tokenId,
+          bid_levels: state.orderBook.bids.length,
+          ask_levels: state.orderBook.asks.length,
+        });
+      } catch (err) {
+        console.error(`[${WORKER_NAME}] orderbook seed token=${tokenId}: ${err.message}`);
+      }
+    }
+  }
+
   async refreshHotSubscriptions(options = {}) {
     const isInitial = options.initial === true;
     const hotMarkets = await getHotMarkets(supabase, POLYMARKET.slug);
@@ -363,10 +416,19 @@ class PolymarketLiveWorker {
     console.log(
       `[${WORKER_NAME}] subscription refresh: hot=${hotMarkets.length} tokens=${nextTokens.size} +${toSubscribe.length} -${toUnsubscribe.length}${isInitial ? ' (initial)' : ''}`
     );
+
+    const tokensToSeed = isInitial ? [...nextTokens] : toSubscribe;
+    if (tokensToSeed.length > 0) {
+      this.seedOrderbooksForTokens(tokensToSeed).catch((err) => {
+        console.error(`[${WORKER_NAME}] orderbook seed batch: ${err.message}`);
+      });
+    }
   }
 
   handleBook(msg) {
     const tokenId = String(msg.asset_id);
+    if (!this.primaryTokens.has(tokenId)) return;
+
     const state = this.getOrCreateState(tokenId);
     if (!state) return;
 
@@ -377,6 +439,14 @@ class PolymarketLiveWorker {
 
     const { bid, ask } = bestFromBook(state.orderBook.bids, state.orderBook.asks);
     const ts = msg.timestamp ? Number(msg.timestamp) : Date.now();
+    setPolymarketBook(state, state.orderBook.bids, state.orderBook.asks, new Date(ts).toISOString());
+    console.log(`[${WORKER_NAME}] orderbook WS book event`, {
+      table: 'market_orderbook_latest',
+      market_id: state.marketId,
+      token_id: tokenId,
+      bid_levels: state.orderBook.bids.length,
+      ask_levels: state.orderBook.asks.length,
+    });
     updateSnapshot(state, { bid, ask, last: state.lastPrice, ts });
   }
 
@@ -425,7 +495,24 @@ class PolymarketLiveWorker {
       const bid = parseProbPrice(change.best_bid);
       const ask = parseProbPrice(change.best_ask);
       const ts = msg.timestamp ? Number(msg.timestamp) : Date.now();
-      updateSnapshot(state, { bid, ask, last: state.lastPrice, ts });
+
+      if (applyPolymarketPriceChange(state, change)) {
+        if (this.primaryTokens.has(tokenId)) {
+          setPolymarketBook(
+            state,
+            state.orderBook.bids,
+            state.orderBook.asks,
+            new Date(ts).toISOString()
+          );
+        }
+      }
+
+      updateSnapshot(state, {
+        bid: bid ?? state.pendingSnapshot?.bid ?? null,
+        ask: ask ?? state.pendingSnapshot?.ask ?? null,
+        last: state.lastPrice,
+        ts,
+      });
     }
   }
 
@@ -523,16 +610,27 @@ class PolymarketLiveWorker {
   async flushLive() {
     const latestByMarket = new Map();
     const tickRows = [];
+    const orderbookRows = [];
 
-    for (const state of this.tokenStates.values()) {
-      if (!state.pendingSnapshot) continue;
-      const snap = state.pendingSnapshot;
-      latestByMarket.set(snap.market_id, snap);
-      tickRows.push(snap);
-      state.pendingSnapshot = null;
+    for (const [tokenId, state] of this.tokenStates.entries()) {
+      if (state.pendingSnapshot) {
+        const snap = state.pendingSnapshot;
+        latestByMarket.set(snap.market_id, snap);
+        tickRows.push(snap);
+        state.pendingSnapshot = null;
+      }
+
+      if (state.pendingOrderbook) {
+        if (this.primaryTokens.has(tokenId)) {
+          orderbookRows.push(rowFromPolymarketBook(state.marketId, state.pendingOrderbook));
+        }
+        state.pendingOrderbook = null;
+      }
     }
 
-    if (tickRows.length === 0) return 0;
+    const dedupedOrderbookRows = dedupeOrderbookRowsByMarket(orderbookRows);
+
+    if (tickRows.length === 0 && dedupedOrderbookRows.length === 0) return 0;
 
     const latestRows = [...latestByMarket.values()].map((snap) => ({
       market_id: snap.market_id,
@@ -543,7 +641,10 @@ class PolymarketLiveWorker {
       updated_at: snap.ts,
     }));
 
-    const { inserted } = await insertWithRetry(supabase, 'live_ticks', tickRows);
+    const { inserted } =
+      tickRows.length > 0
+        ? await insertWithRetry(supabase, 'live_ticks', tickRows)
+        : { inserted: 0 };
 
     if (latestRows.length > 0) {
       const { error } = await supabase.from('market_prices_latest').upsert(latestRows, {
@@ -551,6 +652,25 @@ class PolymarketLiveWorker {
       });
       if (error) {
         console.error(`[${WORKER_NAME}] market_prices_latest upsert: ${error.message}`);
+      }
+    }
+
+    if (dedupedOrderbookRows.length > 0) {
+      const { error } = await supabase.from('market_orderbook_latest').upsert(dedupedOrderbookRows, {
+        onConflict: 'market_id',
+      });
+      if (error) {
+        console.error(`[${WORKER_NAME}] market_orderbook_latest upsert: ${error.message}`);
+      } else {
+        console.log(`[${WORKER_NAME}] market_orderbook_latest upsert`, {
+          count: dedupedOrderbookRows.length,
+          markets: dedupedOrderbookRows.map((row) => ({
+            market_id: row.market_id,
+            bid_levels: row.bids.length,
+            ask_levels: row.asks.length,
+            updated_at: row.updated_at,
+          })),
+        });
       }
     }
 
